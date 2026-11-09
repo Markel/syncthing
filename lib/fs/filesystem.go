@@ -9,28 +9,29 @@ package fs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/ignore/ignoreresult"
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-type filesystemWrapperType int32
-
-const (
-	filesystemWrapperTypeNone filesystemWrapperType = iota
-	filesystemWrapperTypeMtime
-	filesystemWrapperTypeCase
-	filesystemWrapperTypeError
-	filesystemWrapperTypeWalk
-	filesystemWrapperTypeLog
-)
+type XattrFilter interface {
+	Permit(string) bool
+	GetMaxSingleEntrySize() int
+	GetMaxTotalSize() int
+}
 
 // The Filesystem interface abstracts access to the file system.
 type Filesystem interface {
 	Chmod(name string, mode FileMode) error
-	Lchown(name string, uid, gid int) error
+	Lchown(name string, uid, gid string) error // uid/gid as strings; numeric on POSIX, SID on Windows, like in os/user package
 	Chtimes(name string, atime time.Time, mtime time.Time) error
 	Create(name string) (File, error)
 	CreateSymlink(target, name string) error
@@ -45,7 +46,6 @@ type Filesystem interface {
 	RemoveAll(name string) error
 	Rename(oldname, newname string) error
 	Stat(name string) (FileInfo, error)
-	SymlinksSupported() bool
 	Walk(name string, walkFn WalkFunc) error
 	// If setup fails, returns non-nil error, and if afterwards a fatal (!)
 	// error occurs, sends that error on the channel. Afterwards this watch
@@ -60,10 +60,14 @@ type Filesystem interface {
 	URI() string
 	Options() []Option
 	SameFile(fi1, fi2 FileInfo) bool
+	PlatformData(name string, withOwnership, withXattrs bool, xattrFilter XattrFilter) (protocol.PlatformData, error)
+	GetXattr(name string, xattrFilter XattrFilter) ([]protocol.Xattr, error)
+	SetXattr(path string, xattrs []protocol.Xattr, xattrFilter XattrFilter) error
+}
 
+type wrappingFilesystem interface {
 	// Used for unwrapping things
 	underlying() (Filesystem, bool)
-	wrapperType() filesystemWrapperType
 }
 
 // The File interface abstracts access to a regular file, being a somewhat
@@ -91,6 +95,7 @@ type FileInfo interface {
 	Size() int64
 	ModTime() time.Time
 	IsDir() bool
+	Sys() any
 	// Extensions
 	IsRegular() bool
 	IsSymlink() bool
@@ -112,12 +117,7 @@ type Usage struct {
 }
 
 type Matcher interface {
-	ShouldIgnore(name string) bool
-	SkipIgnoredDirs() bool
-}
-
-type MatchResult interface {
-	IsIgnored() bool
+	Match(name string) ignoreresult.R
 }
 
 type Event struct {
@@ -139,105 +139,169 @@ func (evType EventType) Merge(other EventType) EventType {
 }
 
 func (evType EventType) String() string {
-	switch {
-	case evType == NonRemove:
+	switch evType {
+	case NonRemove:
 		return "non-remove"
-	case evType == Remove:
+	case Remove:
 		return "remove"
-	case evType == Mixed:
+	case Mixed:
 		return "mixed"
 	default:
 		panic("bug: Unknown event type")
 	}
 }
 
-var ErrWatchNotSupported = errors.New("watching is not supported")
+var (
+	ErrWatchNotSupported  = errors.New("watching is not supported")
+	ErrXattrsNotSupported = errors.New("extended attributes are not supported on this platform")
+)
 
 // Equivalents from os package.
 
-const ModePerm = FileMode(os.ModePerm)
-const ModeSetgid = FileMode(os.ModeSetgid)
-const ModeSetuid = FileMode(os.ModeSetuid)
-const ModeSticky = FileMode(os.ModeSticky)
-const ModeSymlink = FileMode(os.ModeSymlink)
-const ModeType = FileMode(os.ModeType)
-const PathSeparator = os.PathSeparator
-const OptAppend = os.O_APPEND
-const OptCreate = os.O_CREATE
-const OptExclusive = os.O_EXCL
-const OptReadOnly = os.O_RDONLY
-const OptReadWrite = os.O_RDWR
-const OptSync = os.O_SYNC
-const OptTruncate = os.O_TRUNC
-const OptWriteOnly = os.O_WRONLY
+const (
+	ModePerm      = FileMode(os.ModePerm)
+	ModeSetgid    = FileMode(os.ModeSetgid)
+	ModeSetuid    = FileMode(os.ModeSetuid)
+	ModeSticky    = FileMode(os.ModeSticky)
+	ModeSymlink   = FileMode(os.ModeSymlink)
+	ModeType      = FileMode(os.ModeType)
+	PathSeparator = os.PathSeparator
+	OptAppend     = os.O_APPEND
+	OptCreate     = os.O_CREATE
+	OptExclusive  = os.O_EXCL
+	OptReadOnly   = os.O_RDONLY
+	OptReadWrite  = os.O_RDWR
+	OptSync       = os.O_SYNC
+	OptTruncate   = os.O_TRUNC
+	OptWriteOnly  = os.O_WRONLY
+	OptFollow     = 1 << (bits.UintSize - 2)
+)
+
+func init() {
+	// Ensure OptFollow doesn't clash with any other flag.
+	flags := OptAppend | OptCreate | OptExclusive | OptReadOnly | OptReadWrite | OptSync | OptTruncate | OptWriteOnly
+	flags &= OptFollow
+	if flags != 0 {
+		panic("bug: flag clash")
+	}
+}
 
 // SkipDir is used as a return value from WalkFuncs to indicate that
 // the directory named in the call is to be skipped. It is not returned
 // as an error by any function.
-var SkipDir = filepath.SkipDir
+var SkipDir = filepath.SkipDir //nolint:errname
 
-// IsExist is the equivalent of os.IsExist
-var IsExist = os.IsExist
+func IsExist(err error) bool {
+	return errors.Is(err, ErrExist)
+}
 
-// IsExist is the equivalent of os.ErrExist
-var ErrExist = os.ErrExist
+// ErrExist is the equivalent of os.ErrExist
+var ErrExist = fs.ErrExist
 
 // IsNotExist is the equivalent of os.IsNotExist
-var IsNotExist = os.IsNotExist
+func IsNotExist(err error) bool {
+	return errors.Is(err, ErrNotExist)
+}
 
 // ErrNotExist is the equivalent of os.ErrNotExist
-var ErrNotExist = os.ErrNotExist
+var ErrNotExist = fs.ErrNotExist
 
 // IsPermission is the equivalent of os.IsPermission
-var IsPermission = os.IsPermission
+func IsPermission(err error) bool {
+	return errors.Is(err, fs.ErrPermission)
+}
 
 // IsPathSeparator is the equivalent of os.IsPathSeparator
 var IsPathSeparator = os.IsPathSeparator
 
-// Option modifies a filesystem at creation. An option might be specific
-// to a filesystem-type.
-//
-// String is used to detect options with the same effect, i.e. must be different
-// for options with different effects. Meaning if an option has parameters, a
-// representation of those must be part of the returned string.
-type Option interface {
-	String() string
-	apply(Filesystem)
-}
-
 func NewFilesystem(fsType FilesystemType, uri string, opts ...Option) Filesystem {
+	var caseOpt Option
+	var mtimeOpt Option
+	i := 0
+	for _, opt := range opts {
+		if caseOpt != nil && mtimeOpt != nil {
+			break
+		}
+		switch opt.(type) {
+		case *OptionDetectCaseConflicts:
+			caseOpt = opt
+		case *optionMtime:
+			mtimeOpt = opt
+		default:
+			opts[i] = opt
+			i++
+		}
+	}
+	opts = opts[:i]
+
+	// Construct file system using the registered factory function
 	var fs Filesystem
-	switch fsType {
-	case FilesystemTypeBasic:
-		fs = newBasicFilesystem(uri, opts...)
-	case FilesystemTypeFake:
-		fs = newFakeFilesystem(uri, opts...)
-	default:
-		l.Debugln("Unknown filesystem", fsType, uri)
+	var err error
+	filesystemFactoriesMutex.Lock()
+	fsFactory, factoryFound := filesystemFactories[fsType]
+	filesystemFactoriesMutex.Unlock()
+	if factoryFound {
+		fs, err = fsFactory(uri, opts...)
+	} else {
+		err = fmt.Errorf("File system type '%s' not recognized", fsType)
+	}
+
+	if err != nil {
 		fs = &errorFilesystem{
 			fsType: fsType,
 			uri:    uri,
-			err:    errors.New("filesystem with type " + fsType.String() + " does not exist."),
+			err:    err,
 		}
 	}
 
-	if l.ShouldDebug("walkfs") {
-		return NewWalkFilesystem(&logFilesystem{fs})
+	// mtime handling should happen inside walking, as filesystem calls while
+	// walking should be mtime-resolved too
+	if mtimeOpt != nil {
+		fs = mtimeOpt.apply(fs)
 	}
 
-	if l.ShouldDebug("fs") {
-		return &logFilesystem{NewWalkFilesystem(fs)}
+	fs = &metricsFS{next: fs}
+
+	layersAboveWalkFilesystem := 0
+	if caseOpt != nil {
+		// DirNames calls made to check the case of a name will also be
+		// attributed to the calling function.
+		layersAboveWalkFilesystem++
+	}
+	switch {
+	case l.ShouldDebug("walkfs"):
+		// A walkFilesystem is not a layer to skip, it embeds the underlying
+		// filesystem, passing calls directly trough. Except for calls made
+		// during walking, however those are truly originating in the walk
+		// filesystem.
+		fs = NewWalkFilesystem(newLogFilesystem(fs, layersAboveWalkFilesystem))
+	case l.ShouldDebug("fs"):
+		fs = newLogFilesystem(NewWalkFilesystem(fs), layersAboveWalkFilesystem)
+	default:
+		fs = NewWalkFilesystem(fs)
 	}
 
-	return NewWalkFilesystem(fs)
+	// Case handling is at the outermost layer to resolve all input names.
+	// Reason being is that the only names/paths that are potentially "wrong"
+	// come from outside the fs package. Any paths that result from filesystem
+	// operations itself already have the correct case. Thus there's e.g. no
+	// point to check the case on all the stating the walk filesystem does, it
+	// just adds overhead.
+	if caseOpt != nil {
+		fs = caseOpt.apply(fs)
+	}
+
+	return fs
 }
+
+// fs cannot import config or versioner, so we hard code .stfolder
+// (config.DefaultMarkerName) and .stversions (versioner.DefaultPath)
+var internals = []string{".stfolder", ".stignore", ".stversions"}
 
 // IsInternal returns true if the file, as a path relative to the folder
 // root, represents an internal file that should always be ignored. The file
 // path must be clean (i.e., in canonical shortest form).
 func IsInternal(file string) bool {
-	// fs cannot import config, so we hard code .stfolder here (config.DefaultMarkerName)
-	internals := []string{".stfolder", ".stignore", ".stversions"}
 	for _, internal := range internals {
 		if file == internal {
 			return true
@@ -249,6 +313,11 @@ func IsInternal(file string) bool {
 	return false
 }
 
+var (
+	errPathInvalid           = errors.New("path is invalid")
+	errPathTraversingUpwards = errors.New("relative path traversing upwards (starting with ..)")
+)
+
 // Canonicalize checks that the file path is valid and returns it in the "canonical" form:
 // - /foo/bar -> foo/bar
 // - / -> "."
@@ -259,19 +328,19 @@ func Canonicalize(file string) (string, error) {
 		// The relative path may pretend to be an absolute path within
 		// the root, but the double path separator on Windows implies
 		// something else and is out of spec.
-		return "", errNotRelative
+		return "", errPathInvalid
 	}
 
 	// The relative path should be clean from internal dotdots and similar
-	// funkyness.
+	// funkiness.
 	file = filepath.Clean(file)
 
 	// It is not acceptable to attempt to traverse upwards.
 	if file == ".." {
-		return "", errNotRelative
+		return "", errPathTraversingUpwards
 	}
 	if strings.HasPrefix(file, ".."+pathSep) {
-		return "", errNotRelative
+		return "", errPathTraversingUpwards
 	}
 
 	if strings.HasPrefix(file, pathSep) {
@@ -284,31 +353,40 @@ func Canonicalize(file string) (string, error) {
 	return file, nil
 }
 
-// wrapFilesystem should always be used when wrapping a Filesystem.
-// It ensures proper wrapping order, which right now means:
-// `logFilesystem` needs to be the outermost wrapper for caller lookup.
-func wrapFilesystem(fs Filesystem, wrapFn func(Filesystem) Filesystem) Filesystem {
-	logFs, ok := fs.(*logFilesystem)
-	if ok {
-		fs = logFs.Filesystem
+// unwrapFilesystem removes "wrapping" filesystems to expose the filesystem of the requested wrapper type T, if it exists.
+func unwrapFilesystem[T Filesystem](fs Filesystem) (T, bool) {
+	for {
+		if unwrapped, ok := fs.(T); ok {
+			return unwrapped, true
+		}
+
+		wrappingFs, ok := fs.(wrappingFilesystem)
+		if !ok {
+			var x T
+			return x, false
+		}
+
+		fs, ok = wrappingFs.underlying()
+		if !ok {
+			var x T
+			return x, false
+		}
 	}
-	fs = wrapFn(fs)
-	if ok {
-		fs = &logFilesystem{fs}
-	}
-	return fs
 }
 
-// unwrapFilesystem removes "wrapping" filesystems to expose the filesystem of the requested wrapperType, if it exists.
-func unwrapFilesystem(fs Filesystem, wrapperType filesystemWrapperType) (Filesystem, bool) {
-	var ok bool
-	for {
-		if fs.wrapperType() == wrapperType {
-			return fs, true
-		}
-		fs, ok = fs.underlying()
-		if !ok {
-			return nil, false
-		}
+// WriteFile writes data to the named file, creating it if necessary.
+// If the file does not exist, WriteFile creates it with permissions perm (before umask);
+// otherwise WriteFile truncates it before writing, without changing permissions.
+// Since Writefile requires multiple system calls to complete, a failure mid-operation
+// can leave the file in a partially written state.
+func WriteFile(fs Filesystem, name string, data []byte, perm FileMode) error {
+	f, err := fs.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
 	}
+	_, err = f.Write(data)
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+	return err
 }

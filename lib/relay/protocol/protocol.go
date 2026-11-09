@@ -17,10 +17,11 @@ var (
 	ResponseSuccess           = Response{0, "success"}
 	ResponseNotFound          = Response{1, "not found"}
 	ResponseAlreadyConnected  = Response{2, "already connected"}
+	ResponseWrongToken        = Response{3, "wrong token"}
 	ResponseUnexpectedMessage = Response{100, "unexpected message"}
 )
 
-func WriteMessage(w io.Writer, message interface{}) error {
+func WriteMessage(w io.Writer, message any) error {
 	header := header{
 		magic: magic,
 	}
@@ -72,7 +73,7 @@ func WriteMessage(w io.Writer, message interface{}) error {
 	return err
 }
 
-func ReadMessage(r io.Reader) (interface{}, error) {
+func ReadMessage(r io.Reader) (any, error) {
 	var header header
 
 	buf := make([]byte, header.XDRSize())
@@ -107,6 +108,14 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 		return msg, err
 	case messageTypeJoinRelayRequest:
 		var msg JoinRelayRequest
+
+		// In prior versions of the protocol JoinRelayRequest did not have a
+		// token field. Trying to unmarshal such a request will result in
+		// an error, return msg with an empty token instead.
+		if header.messageLength == 0 {
+			return msg, nil
+		}
+
 		err := msg.UnmarshalXDR(buf)
 		return msg, err
 	case messageTypeJoinSessionRequest:

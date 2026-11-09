@@ -7,24 +7,27 @@
 package connections
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/thejerf/suture/v4"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 )
 
@@ -258,7 +261,7 @@ func TestNextDialRegistryCleanup(t *testing.T) {
 		},
 		// Threshold reached, but outside of cooldown delay
 		{
-			attempts:              dialCoolDownMaxAttemps,
+			attempts:              dialCoolDownMaxAttempts,
 			coolDownIntervalStart: firsts[2],
 		},
 	} {
@@ -278,11 +281,11 @@ func TestNextDialRegistryCleanup(t *testing.T) {
 		},
 		// attempts at threshold, inside delay
 		{
-			attempts:              dialCoolDownMaxAttemps,
+			attempts:              dialCoolDownMaxAttempts,
 			coolDownIntervalStart: firsts[0],
 		},
 		{
-			attempts:              dialCoolDownMaxAttemps,
+			attempts:              dialCoolDownMaxAttempts,
 			coolDownIntervalStart: firsts[1],
 		},
 	} {
@@ -294,7 +297,7 @@ func TestNextDialRegistryCleanup(t *testing.T) {
 	}
 }
 
-func BenchmarkConnections(pb *testing.B) {
+func BenchmarkConnections(b *testing.B) {
 	addrs := []string{
 		"tcp://127.0.0.1:0",
 		"quic://127.0.0.1:0",
@@ -315,9 +318,13 @@ func BenchmarkConnections(pb *testing.B) {
 	}
 	for _, addr := range addrs {
 		for _, sz := range sizes {
+			data := make([]byte, sz)
+			if _, err := rand.Read(data); err != nil {
+				b.Fatal(err)
+			}
 			for _, direction := range []string{"cs", "sc"} {
 				proto := strings.SplitN(addr, ":", 2)[0]
-				pb.Run(fmt.Sprintf("%s_%d_%s", proto, sz, direction), func(b *testing.B) {
+				b.Run(fmt.Sprintf("%s_%d_%s", proto, sz, direction), func(b *testing.B) {
 					if proto == "relay" && !haveRelay {
 						b.Skip("could not connect to relay")
 					}
@@ -325,61 +332,76 @@ func BenchmarkConnections(pb *testing.B) {
 						if direction == "sc" {
 							server, client = client, server
 						}
-						data := make([]byte, sz)
-						if _, err := rand.Read(data); err != nil {
-							b.Fatal(err)
-						}
 
 						total := 0
-						wg := sync.NewWaitGroup()
 						b.ResetTimer()
 						for i := 0; i < b.N; i++ {
-							wg.Add(2)
-							go func() {
-								if err := sendMsg(client, data); err != nil {
-									b.Fatal(err)
+							var wg sync.WaitGroup
+							errC := make(chan error, 2)
+							wg.Go(func() {
+								if _, err := client.Write(data); err != nil {
+									errC <- err
+									return
 								}
-								wg.Done()
-							}()
-							go func() {
-								if err := recvMsg(server, data); err != nil {
-									b.Fatal(err)
+							})
+							wg.Go(func() {
+								if _, err := io.ReadFull(server, data); err != nil {
+									errC <- err
+									return
 								}
 								total += sz
-								wg.Done()
-							}()
+							})
 							wg.Wait()
+							close(errC)
+							err := <-errC
+							if err != nil {
+								b.Fatal(err)
+							}
 						}
 						b.ReportAllocs()
 						b.SetBytes(int64(total / b.N))
 					})
 				})
 			}
-
 		}
 	}
 }
 
-func sendMsg(c internalConn, buf []byte) error {
-	n, err := c.Write(buf)
-	if n != len(buf) || err != nil {
-		return err
+func TestConnectionEstablishment(t *testing.T) {
+	addrs := []string{
+		"tcp://127.0.0.1:0",
+		"quic://127.0.0.1:0",
 	}
-	return nil
+
+	send := make([]byte, 128<<10)
+	if _, err := rand.Read(send); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, addr := range addrs {
+		proto := strings.SplitN(addr, ":", 2)[0]
+
+		t.Run(proto, func(t *testing.T) {
+			withConnectionPair(t, addr, func(client, server internalConn) {
+				if _, err := client.Write(send); err != nil {
+					t.Fatal(err)
+				}
+
+				recv := make([]byte, len(send))
+				if _, err := io.ReadFull(server, recv); err != nil {
+					t.Fatal(err)
+				}
+
+				if !bytes.Equal(recv, send) {
+					t.Fatal("data mismatch")
+				}
+			})
+		})
+
+	}
 }
 
-func recvMsg(c internalConn, buf []byte) error {
-	for read := 0; read != len(buf); {
-		n, err := c.Read(buf)
-		read += n
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func withConnectionPair(b *testing.B, connUri string, h func(client, server internalConn)) {
+func withConnectionPair(b interface{ Fatal(...any) }, connUri string, h func(client, server internalConn)) {
 	// Root of the service tree.
 	supervisor := suture.New("main", suture.Spec{
 		PassThroughPanics: true,
@@ -414,7 +436,8 @@ func withConnectionPair(b *testing.B, connUri string, h func(client, server inte
 	}
 	natSvc := nat.NewService(deviceId, wcfg)
 	conns := make(chan internalConn, 1)
-	listenSvc := lf.New(uri, wcfg, tlsCfg, conns, natSvc)
+	lanChecker := &lanChecker{wcfg}
+	listenSvc := lf.New(uri, wcfg, tlsCfg, conns, natSvc, registry.New(), lanChecker)
 	supervisor.Add(listenSvc)
 
 	var addr *url.URL
@@ -433,7 +456,8 @@ func withConnectionPair(b *testing.B, connUri string, h func(client, server inte
 	if err != nil {
 		b.Fatal(err)
 	}
-	dialer := df.New(cfg.Options, tlsCfg)
+	// Purposely using a different registry: Don't want to reuse port between dialer and listener on the same device
+	dialer := df.New(cfg.Options, tlsCfg, registry.New(), lanChecker)
 
 	// Relays might take some time to register the device, so dial multiple times
 	clientConn, err := dialer.Dial(ctx, deviceId, addr)
@@ -447,18 +471,21 @@ func withConnectionPair(b *testing.B, connUri string, h func(client, server inte
 		}
 	}
 
-	data := []byte("hello")
-
 	// Quic does not start a stream until some data is sent through, so send something for the AcceptStream
 	// to fire on the other side.
-	if err := sendMsg(clientConn, data); err != nil {
+	send := []byte("hello")
+	if _, err := clientConn.Write(send); err != nil {
 		b.Fatal(err)
 	}
 
 	serverConn := <-conns
 
-	if err := recvMsg(serverConn, data); err != nil {
+	recv := make([]byte, len(send))
+	if _, err := io.ReadFull(serverConn, recv); err != nil {
 		b.Fatal(err)
+	}
+	if !bytes.Equal(recv, send) {
+		b.Fatal("data mismatch")
 	}
 
 	h(clientConn, serverConn)
@@ -467,7 +494,7 @@ func withConnectionPair(b *testing.B, connUri string, h func(client, server inte
 	_ = serverConn.Close()
 }
 
-func mustGetCert(b *testing.B) tls.Certificate {
+func mustGetCert(b interface{ Fatal(...any) }) tls.Certificate {
 	cert, err := tlsutil.NewCertificateInMemory("bench", 10)
 	if err != nil {
 		b.Fatal(err)

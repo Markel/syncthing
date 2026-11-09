@@ -4,8 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
-//go:generate counterfeiter -o mocks/buffered_subscription.go --fake-name BufferedSubscription . BufferedSubscription
+//go:generate go tool counterfeiter -o mocks/buffered_subscription.go --fake-name BufferedSubscription . BufferedSubscription
 
 // Package events provides event subscription and polling functionality.
 package events
@@ -16,11 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/syncutil"
 	"github.com/thejerf/suture/v4"
-
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 type EventType int64
@@ -35,6 +34,7 @@ const (
 	PendingDevicesChanged
 	DevicePaused
 	DeviceResumed
+	ClusterConfigReceived
 	LocalChangeDetected
 	RemoteChangeDetected
 	LocalIndexUpdated
@@ -57,6 +57,7 @@ const (
 	ListenAddressesChanged
 	LoginAttempt
 	Failure
+	UpgradeRestartScheduled
 
 	AllEvents = (1 << iota) - 1
 )
@@ -118,6 +119,8 @@ func (t EventType) String() string {
 		return "DevicePaused"
 	case DeviceResumed:
 		return "DeviceResumed"
+	case ClusterConfigReceived:
+		return "ClusterConfigReceived"
 	case FolderScanProgress:
 		return "FolderScanProgress"
 	case FolderPaused:
@@ -132,6 +135,8 @@ func (t EventType) String() string {
 		return "FolderWatchStateChanged"
 	case Failure:
 		return "Failure"
+	case UpgradeRestartScheduled:
+		return "UpgradeRestartScheduled"
 	default:
 		return "Unknown"
 	}
@@ -203,6 +208,8 @@ func UnmarshalEventType(s string) EventType {
 		return DevicePaused
 	case "DeviceResumed":
 		return DeviceResumed
+	case "ClusterConfigReceived":
+		return ClusterConfigReceived
 	case "FolderScanProgress":
 		return FolderScanProgress
 	case "FolderPaused":
@@ -217,6 +224,8 @@ func UnmarshalEventType(s string) EventType {
 		return FolderWatchStateChanged
 	case "Failure":
 		return Failure
+	case "UpgradeRestartScheduled":
+		return UpgradeRestartScheduled
 	default:
 		return 0
 	}
@@ -226,7 +235,7 @@ const BufferSize = 64
 
 type Logger interface {
 	suture.Service
-	Log(t EventType, data interface{})
+	Log(t EventType, data any)
 	Subscribe(mask EventType) Subscription
 }
 
@@ -244,10 +253,10 @@ type Event struct {
 	// Per-subscription sequential event ID. Named "id" for backwards compatibility with the REST API
 	SubscriptionID int `json:"id"`
 	// Global ID of the event across all subscriptions
-	GlobalID int         `json:"globalID"`
-	Time     time.Time   `json:"time"`
-	Type     EventType   `json:"type"`
-	Data     interface{} `json:"data"`
+	GlobalID int       `json:"globalID"`
+	Time     time.Time `json:"time"`
+	Type     EventType `json:"type"`
+	Data     any       `json:"data"`
 }
 
 type Subscription interface {
@@ -292,6 +301,7 @@ loop:
 		case e := <-l.events:
 			// Incoming events get sent
 			l.sendEvent(e)
+			metricEvents.WithLabelValues(e.Type.String(), metricEventStateCreated).Inc()
 
 		case fn := <-l.funcs:
 			// Subscriptions are handled here.
@@ -315,7 +325,7 @@ loop:
 	return nil
 }
 
-func (l *logger) Log(t EventType, data interface{}) {
+func (l *logger) Log(t EventType, data any) {
 	l.events <- Event{
 		Time: time.Now(), // intentionally high precision
 		Type: t,
@@ -340,9 +350,11 @@ func (l *logger) sendEvent(e Event) {
 
 			select {
 			case s.events <- e:
+				metricEvents.WithLabelValues(e.Type.String(), metricEventStateDelivered).Inc()
 			case <-l.timeout.C:
 				// if s.events is not ready, drop the event
 				timedOut = true
+				metricEvents.WithLabelValues(e.Type.String(), metricEventStateDropped).Inc()
 			}
 
 			// If stop returns false it already sent something to the
@@ -466,7 +478,7 @@ type bufferedSubscription struct {
 	next int
 	cur  int // Current SubscriptionID
 	mut  sync.Mutex
-	cond *sync.TimeoutCond
+	cond *syncutil.TimeoutCond
 }
 
 type BufferedSubscription interface {
@@ -478,9 +490,8 @@ func NewBufferedSubscription(s Subscription, size int) BufferedSubscription {
 	bs := &bufferedSubscription{
 		sub: s,
 		buf: make([]Event, size),
-		mut: sync.NewMutex(),
 	}
-	bs.cond = sync.NewTimeoutCond(bs.mut)
+	bs.cond = syncutil.NewTimeoutCond(&bs.mut)
 	go bs.pollingLoop()
 	return bs
 }
@@ -518,7 +529,7 @@ func (s *bufferedSubscription) Since(id int, into []Event, timeout time.Duration
 			into = append(into, s.buf[i])
 		}
 	}
-	for i := 0; i < s.next; i++ {
+	for i := range s.next {
 		if s.buf[i].SubscriptionID > id {
 			into = append(into, s.buf[i])
 		}
@@ -546,13 +557,11 @@ type noopLogger struct{}
 
 var NoopLogger Logger = &noopLogger{}
 
-func (*noopLogger) Serve(ctx context.Context) error { return nil }
+func (*noopLogger) Serve(_ context.Context) error { return nil }
 
-func (*noopLogger) Stop() {}
+func (*noopLogger) Log(_ EventType, _ any) {}
 
-func (*noopLogger) Log(t EventType, data interface{}) {}
-
-func (*noopLogger) Subscribe(mask EventType) Subscription {
+func (*noopLogger) Subscribe(_ EventType) Subscription {
 	return &noopSubscription{}
 }
 
@@ -562,11 +571,11 @@ func (*noopSubscription) C() <-chan Event {
 	return nil
 }
 
-func (*noopSubscription) Poll(timeout time.Duration) (Event, error) {
+func (*noopSubscription) Poll(_ time.Duration) (Event, error) {
 	return Event{}, errNoop
 }
 
-func (s *noopSubscription) Mask() EventType {
+func (*noopSubscription) Mask() EventType {
 	return 0
 }
 

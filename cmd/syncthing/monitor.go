@@ -9,28 +9,31 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/svcutil"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 var (
 	stdoutFirstLines []string // The first 10 lines of stdout
 	stdoutLastLines  []string // The last 50 lines of stdout
-	stdoutMut        = sync.NewMutex()
+	stdoutMut        sync.Mutex
 )
 
 const (
@@ -43,12 +46,10 @@ const (
 	panicUploadNoticeWait = 10 * time.Second
 )
 
-func monitorMain(options serveOptions) {
-	l.SetPrefix("[monitor] ")
-
+func (c *serveCmd) monitorMain() {
 	var dst io.Writer = os.Stdout
 
-	logFile := options.LogFile
+	logFile := locations.Get(locations.LogFile)
 	if logFile != "-" {
 		if expanded, err := fs.ExpandTilde(logFile); err == nil {
 			logFile = expanded
@@ -58,15 +59,15 @@ func monitorMain(options serveOptions) {
 		open := func(name string) (io.WriteCloser, error) {
 			return newAutoclosedFile(name, logFileAutoCloseDelay, logFileMaxOpenTime)
 		}
-		if options.LogMaxSize > 0 {
-			fileDst, err = newRotatedFile(logFile, open, int64(options.LogMaxSize), options.LogMaxFiles)
+		if c.LogMaxSize > 0 {
+			fileDst, err = newRotatedFile(logFile, open, int64(c.LogMaxSize), c.LogMaxFiles)
 		} else {
 			fileDst, err = open(logFile)
 		}
 		if err != nil {
-			l.Warnln("Failed to setup logging to file, proceeding with logging to stdout only:", err)
+			slog.Error("Failed to set up logging to file, proceeding with logging to stdout only", slogutil.Error(err))
 		} else {
-			if runtime.GOOS == "windows" {
+			if build.IsWindows {
 				// Translate line breaks to Windows standard
 				fileDst = osutil.ReplacingWriter{
 					Writer: fileDst,
@@ -75,14 +76,23 @@ func monitorMain(options serveOptions) {
 				}
 			}
 
-			// Log to both stdout and file.
-			dst = io.MultiWriter(dst, fileDst)
+			// Log to both stdout and file. Unlike io.MultiWriter, this
+			// does not abort writing to the remaining writers if one of
+			// them fails, which matters because stdout may not be a
+			// valid writer at all (e.g. when started detached from any
+			// console on Windows).
+			dst = osutil.TolerantMultiWriter{dst, fileDst}
 
-			l.Infof(`Log output saved to file "%s"`, logFile)
+			slog.Info("Saved log output", slogutil.FilePath(logFile))
 		}
 	}
 
 	args := os.Args
+	binary, err := getBinary(args[0])
+	if err != nil {
+		slog.Error("Failed to start the main Syncthing process", slogutil.Error(err))
+		panic("Error starting the main Syncthing process")
+	}
 	var restarts [restartCounts]time.Time
 
 	stopSign := make(chan os.Signal, 1)
@@ -97,14 +107,14 @@ func monitorMain(options serveOptions) {
 		maybeReportPanics()
 
 		if t := time.Since(restarts[0]); t < restartLoopThreshold {
-			l.Warnf("%d restarts in %v; not retrying further", restartCounts, t)
+			slog.Error("Too many restarts; not retrying further", slog.Int("count", restartCounts), slog.Any("interval", t))
 			os.Exit(svcutil.ExitError.AsInt())
 		}
 
 		copy(restarts[0:], restarts[1:])
 		restarts[len(restarts)-1] = time.Now()
 
-		cmd := exec.Command(args[0], args[1:]...)
+		cmd := exec.Command(binary, args[1:]...)
 		cmd.Env = childEnv
 
 		stderr, err := cmd.StderrPipe()
@@ -117,10 +127,10 @@ func monitorMain(options serveOptions) {
 			panic(err)
 		}
 
-		l.Debugln("Starting syncthing")
+		slog.Debug("Starting syncthing")
 		err = cmd.Start()
 		if err != nil {
-			l.Warnln("Error starting the main Syncthing process:", err)
+			slog.Error("Failed to start the main Syncthing process", slogutil.Error(err))
 			panic("Error starting the main Syncthing process")
 		}
 
@@ -129,19 +139,10 @@ func monitorMain(options serveOptions) {
 		stdoutLastLines = make([]string, 0, 50)
 		stdoutMut.Unlock()
 
-		wg := sync.NewWaitGroup()
+		var wg sync.WaitGroup
 
-		wg.Add(1)
-		go func() {
-			copyStderr(stderr, dst)
-			wg.Done()
-		}()
-
-		wg.Add(1)
-		go func() {
-			copyStdout(stdout, dst)
-			wg.Done()
-		}()
+		wg.Go(func() { copyStderr(stderr, dst) })
+		wg.Go(func() { copyStdout(stdout, dst) })
 
 		exit := make(chan error)
 
@@ -153,13 +154,13 @@ func monitorMain(options serveOptions) {
 		stopped := false
 		select {
 		case s := <-stopSign:
-			l.Infof("Signal %d received; exiting", s)
+			slog.Info("Received signal; exiting", "signal", s)
 			cmd.Process.Signal(sigTerm)
 			err = <-exit
 			stopped = true
 
 		case s := <-restartSign:
-			l.Infof("Signal %d received; restarting", s)
+			slog.Info("Received signal; restarting", "signal", s)
 			cmd.Process.Signal(sigHup)
 			err = <-exit
 
@@ -171,27 +172,33 @@ func monitorMain(options serveOptions) {
 			os.Exit(svcutil.ExitSuccess.AsInt())
 		}
 
-		if exiterr, ok := err.(*exec.ExitError); ok {
+		exiterr := &exec.ExitError{}
+		if errors.As(err, &exiterr) {
 			exitCode := exiterr.ExitCode()
-			if stopped || options.NoRestart {
+			switch {
+			case stopped || c.NoRestart:
 				os.Exit(exitCode)
-			}
-			if exitCode == svcutil.ExitUpgrade.AsInt() {
+
+			case exitCode == svcutil.ExitUpgrade.AsInt():
 				// Restart the monitor process to release the .old
 				// binary as part of the upgrade process.
-				l.Infoln("Restarting monitor...")
-				if err = restartMonitor(args); err != nil {
-					l.Warnln("Restart:", err)
+				slog.Info("Restarting monitor...")
+				if err = restartMonitor(binary, args); err != nil {
+					slog.Error("Failed to restart monitor", slogutil.Error(err))
 				}
+				os.Exit(exitCode)
+
+			case exitCode == svcutil.ExitNoRestart.AsInt():
+				// Requested to not restart the child
 				os.Exit(exitCode)
 			}
 		}
 
-		if options.NoRestart {
+		if c.NoRestart {
 			os.Exit(svcutil.ExitError.AsInt())
 		}
 
-		l.Infoln("Syncthing exited:", err)
+		slog.Info("Syncthing exited", slogutil.Error(err))
 		time.Sleep(restartPause)
 
 		if first {
@@ -201,6 +208,19 @@ func monitorMain(options serveOptions) {
 			first = false
 		}
 	}
+}
+
+func getBinary(args0 string) (string, error) {
+	e, err := os.Executable()
+	if err == nil {
+		return e, nil
+	}
+	// Check if args0 cuts it
+	e, lerr := exec.LookPath(args0)
+	if lerr == nil {
+		return e, nil
+	}
+	return "", err
 }
 
 func copyStderr(stderr io.Reader, dst io.Writer) {
@@ -220,62 +240,28 @@ func copyStderr(stderr io.Reader, dst io.Writer) {
 			return
 		}
 
-		if panicFd == nil {
-			dst.Write([]byte(line))
+		dst.Write([]byte(line))
 
-			if strings.Contains(line, "SIGILL") {
-				l.Warnln(`
-*******************************************************************************
-* Crash due to illegal instruction detected. This is most likely due to a CPU *
-* incompatibility with the high performance hashing package. Switching to the *
-* standard hashing package instead. Please report this issue at:              *
-*                                                                             *
-*   https://github.com/syncthing/syncthing/issues                             *
-*                                                                             *
-* Include the details of your CPU.                                            *
-*******************************************************************************
-`)
-				os.Setenv("STHASHING", "standard")
-				return
+		if panicFd == nil && (strings.HasPrefix(line, "panic:") || strings.HasPrefix(line, "fatal error:") || strings.HasPrefix(line, "runtime:")) {
+			panicFd, err = os.Create(locations.GetTimestamped(locations.PanicLog))
+			if err != nil {
+				slog.Error("Failed to create panic log", slogutil.Error(err))
+				continue
 			}
 
-			if strings.HasPrefix(line, "panic:") || strings.HasPrefix(line, "fatal error:") {
-				panicFd, err = os.Create(locations.GetTimestamped(locations.PanicLog))
-				if err != nil {
-					l.Warnln("Create panic log:", err)
-					continue
-				}
+			slog.Error("Panic detected, writing to file", slogutil.FilePath(panicFd.Name()))
+			slog.Info("Please check for existing issues with similar panic message at https://github.com/syncthing/syncthing/issues/")
+			slog.Info("If no issue with similar panic message exists, please create a new issue with the panic log attached")
 
-				l.Warnf("Panic detected, writing to \"%s\"", panicFd.Name())
-				if strings.Contains(line, "leveldb") && strings.Contains(line, "corrupt") {
-					l.Warnln(`
-*********************************************************************************
-* Crash due to corrupt database.                                                *
-*                                                                               *
-* This crash usually occurs due to one of the following reasons:                *
-*  - Syncthing being stopped abruptly (killed/loss of power)                    *
-*  - Bad hardware (memory/disk issues)                                          *
-*  - Software that affects disk writes (SSD caching software and simillar)      *
-*                                                                               *
-* Please see the following URL for instructions on how to recover:              *
-*   https://docs.syncthing.net/users/faq.html#my-syncthing-database-is-corrupt  *
-*********************************************************************************
-`)
-				} else {
-					l.Warnln("Please check for existing issues with similar panic message at https://github.com/syncthing/syncthing/issues/")
-					l.Warnln("If no issue with similar panic message exists, please create a new issue with the panic log attached")
-				}
-
-				stdoutMut.Lock()
-				for _, line := range stdoutFirstLines {
-					panicFd.WriteString(line)
-				}
-				panicFd.WriteString("...\n")
-				for _, line := range stdoutLastLines {
-					panicFd.WriteString(line)
-				}
-				stdoutMut.Unlock()
+			stdoutMut.Lock()
+			for _, line := range stdoutFirstLines {
+				panicFd.WriteString(line)
 			}
+			panicFd.WriteString("...\n")
+			for _, line := range stdoutLastLines {
+				panicFd.WriteString(line)
+			}
+			stdoutMut.Unlock()
 
 			panicFd.WriteString("Panic at " + time.Now().Format(time.RFC3339) + "\n")
 		}
@@ -309,40 +295,30 @@ func copyStdout(stdout io.Reader, dst io.Writer) {
 	}
 }
 
-func restartMonitor(args []string) error {
+func restartMonitor(binary string, args []string) error {
 	// Set the STRESTART environment variable to indicate to the next
 	// process that this is a restart and not initial start. This prevents
 	// opening the browser on startup.
 	os.Setenv("STRESTART", "yes")
 
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		// syscall.Exec is the cleanest way to restart on Unixes as it
 		// replaces the current process with the new one, keeping the pid and
 		// controlling terminal and so on
-		return restartMonitorUnix(args)
+		return restartMonitorUnix(binary, args)
 	}
 
 	// but it isn't supported on Windows, so there we start a normal
 	// exec.Command and return.
-	return restartMonitorWindows(args)
+	return restartMonitorWindows(binary, args)
 }
 
-func restartMonitorUnix(args []string) error {
-	if !strings.ContainsRune(args[0], os.PathSeparator) {
-		// The path to the binary doesn't contain a slash, so it should be
-		// found in $PATH.
-		binary, err := exec.LookPath(args[0])
-		if err != nil {
-			return err
-		}
-		args[0] = binary
-	}
-
-	return syscall.Exec(args[0], args, os.Environ())
+func restartMonitorUnix(binary string, args []string) error {
+	return syscall.Exec(binary, args, os.Environ())
 }
 
-func restartMonitorWindows(args []string) error {
-	cmd := exec.Command(args[0], args[1:]...)
+func restartMonitorWindows(binary string, args []string) error {
+	cmd := exec.Command(binary, args[1:]...)
 	// Retain the standard streams
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
@@ -456,7 +432,6 @@ func newAutoclosedFile(name string, closeDelay, maxOpenTime time.Duration) (*aut
 		name:        name,
 		closeDelay:  closeDelay,
 		maxOpenTime: maxOpenTime,
-		mut:         sync.NewMutex(),
 		closed:      make(chan struct{}),
 		closeTimer:  time.NewTimer(time.Minute),
 	}
@@ -513,7 +488,7 @@ func (f *autoclosedFile) ensureOpenLocked() error {
 	// We open the file for write only, and create it if it doesn't exist.
 	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
 
-	fd, err := os.OpenFile(f.name, flags, 0644)
+	fd, err := os.OpenFile(f.name, flags, 0o666)
 	if err != nil {
 		return err
 	}
@@ -564,7 +539,7 @@ func maybeReportPanics() {
 	// Try to get a config to see if/where panics should be reported.
 	cfg, err := loadOrDefaultConfig()
 	if err != nil {
-		l.Warnln("Couldn't load config; not reporting crash")
+		slog.Error("Couldn't load config; not reporting crash")
 		return
 	}
 
@@ -584,7 +559,7 @@ func maybeReportPanics() {
 		case <-ctx.Done():
 			return
 		case <-time.After(panicUploadNoticeWait):
-			l.Warnln("Uploading crash reports is taking a while, please wait...")
+			slog.Warn("Uploading crash reports is taking a while, please wait")
 		}
 	}()
 

@@ -7,42 +7,49 @@
 package cli
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"net/http"
+	"path/filepath"
 
-	"github.com/urfave/cli"
+	"github.com/alecthomas/kong"
+	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/fs"
 )
 
-var operationCommand = cli.Command{
-	Name:     "operations",
-	HideHelp: true,
-	Usage:    "Operation command group",
-	Subcommands: []cli.Command{
-		{
-			Name:   "restart",
-			Usage:  "Restart syncthing",
-			Action: expects(0, emptyPost("system/restart")),
-		},
-		{
-			Name:   "shutdown",
-			Usage:  "Shutdown syncthing",
-			Action: expects(0, emptyPost("system/shutdown")),
-		},
-		{
-			Name:   "upgrade",
-			Usage:  "Upgrade syncthing (if a newer version is available)",
-			Action: expects(0, emptyPost("system/upgrade")),
-		},
-		{
-			Name:      "folder-override",
-			Usage:     "Override changes on folder (remote for sendonly, local for receiveonly). WARNING: Destructive - deletes/changes your data.",
-			ArgsUsage: "[folder id]",
-			Action:    expects(1, foldersOverride),
-		},
-	},
+type folderOverrideCommand struct {
+	FolderID string `arg:""`
 }
 
-func foldersOverride(c *cli.Context) error {
-	client, err := getClientFactory(c).getClient()
+type defaultIgnoresCommand struct {
+	Path string `arg:""`
+}
+
+type operationCommand struct {
+	Restart        struct{}              `cmd:"" help:"Restart syncthing"`
+	Shutdown       struct{}              `cmd:"" help:"Shutdown syncthing"`
+	Upgrade        struct{}              `cmd:"" help:"Upgrade syncthing (if a newer version is available)"`
+	FolderOverride folderOverrideCommand `cmd:"" help:"Override changes on folder (remote for sendonly, local for receiveonly). WARNING: Destructive - deletes/changes your data"`
+	DefaultIgnores defaultIgnoresCommand `cmd:"" help:"Set the default ignores (config) from a file"`
+}
+
+func (*operationCommand) Run(ctx Context, kongCtx *kong.Context) error {
+	f := ctx.clientFactory
+
+	switch kongCtx.Selected().Name {
+	case "restart":
+		return emptyPost("system/restart", f)
+	case "shutdown":
+		return emptyPost("system/shutdown", f)
+	case "upgrade":
+		return emptyPost("system/upgrade", f)
+	}
+	return nil
+}
+
+func (f *folderOverrideCommand) Run(ctx Context) error {
+	client, err := ctx.clientFactory.getClient()
 	if err != nil {
 		return err
 	}
@@ -50,14 +57,14 @@ func foldersOverride(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	rid := c.Args()[0]
+	rid := f.FolderID
 	for _, folder := range cfg.Folders {
 		if folder.ID == rid {
 			response, err := client.Post("db/override", "")
 			if err != nil {
 				return err
 			}
-			if response.StatusCode != 200 {
+			if response.StatusCode != http.StatusOK {
 				errStr := fmt.Sprint("Failed to override changes\nStatus code: ", response.StatusCode)
 				bytes, err := responseToBArray(response)
 				if err != nil {
@@ -67,10 +74,36 @@ func foldersOverride(c *cli.Context) error {
 				if body != "" {
 					errStr += "\nBody: " + body
 				}
-				return fmt.Errorf(errStr)
+				return errors.New(errStr)
 			}
 			return nil
 		}
 	}
-	return fmt.Errorf("Folder " + rid + " not found")
+	return fmt.Errorf("Folder %q not found", rid)
+}
+
+func (d *defaultIgnoresCommand) Run(ctx Context) error {
+	client, err := ctx.clientFactory.getClient()
+	if err != nil {
+		return err
+	}
+	dir, file := filepath.Split(d.Path)
+	filesystem := fs.NewFilesystem(fs.FilesystemTypeBasic, dir)
+
+	fd, err := filesystem.Open(file)
+	if err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(fd)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	fd.Close()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	_, err = client.PutJSON("config/defaults/ignores", config.Ignores{Lines: lines})
+	return err
 }

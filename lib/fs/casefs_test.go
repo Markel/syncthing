@@ -9,10 +9,9 @@ package fs
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -28,17 +27,20 @@ func TestRealCase(t *testing.T) {
 		testRealCase(t, newFakeFilesystem(t.Name()+"?insens=true"))
 	})
 	t.Run("actual", func(t *testing.T) {
-		fsys, tmpDir := setup(t)
-		defer os.RemoveAll(tmpDir)
+		fsys, _ := setup(t)
 		testRealCase(t, fsys)
 	})
 }
 
+func newCaseFilesystem(fsys Filesystem) *caseFilesystem {
+	return globalCaseFilesystemRegistry.get(fsys).(*caseFilesystem)
+}
+
 func testRealCase(t *testing.T, fsys Filesystem) {
-	testFs := NewCaseFilesystem(fsys).(*caseFilesystem)
+	testFs := newCaseFilesystem(fsys)
 	comps := []string{"Foo", "bar", "BAZ", "bAs"}
 	path := filepath.Join(comps...)
-	testFs.MkdirAll(filepath.Join(comps[:len(comps)-1]...), 0777)
+	testFs.MkdirAll(filepath.Join(comps[:len(comps)-1]...), 0o777)
 	fd, err := testFs.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -79,20 +81,19 @@ func TestRealCaseSensitive(t *testing.T) {
 		testRealCaseSensitive(t, newFakeFilesystem(t.Name()))
 	})
 	t.Run("actual", func(t *testing.T) {
-		fsys, tmpDir := setup(t)
-		defer os.RemoveAll(tmpDir)
+		fsys, _ := setup(t)
 		testRealCaseSensitive(t, fsys)
 	})
 }
 
 func testRealCaseSensitive(t *testing.T, fsys Filesystem) {
-	testFs := NewCaseFilesystem(fsys).(*caseFilesystem)
+	testFs := newCaseFilesystem(fsys)
 
 	names := make([]string, 2)
 	names[0] = "foo"
 	names[1] = strings.ToUpper(names[0])
 	for _, n := range names {
-		if err := testFs.MkdirAll(n, 0777); err != nil {
+		if err := testFs.MkdirAll(n, 0o777); err != nil {
 			if IsErrCaseConflict(err) {
 				t.Skip("Filesystem is case-insensitive")
 			}
@@ -120,8 +121,7 @@ func TestCaseFSStat(t *testing.T) {
 		testCaseFSStat(t, newFakeFilesystem(t.Name()+"?insens=true"))
 	})
 	t.Run("actual", func(t *testing.T) {
-		fsys, tmpDir := setup(t)
-		defer os.RemoveAll(tmpDir)
+		fsys, _ := setup(t)
 		testCaseFSStat(t, fsys)
 	})
 }
@@ -139,7 +139,7 @@ func testCaseFSStat(t *testing.T, fsys Filesystem) {
 		sensitive = false
 	}
 
-	testFs := NewCaseFilesystem(fsys)
+	testFs := newCaseFilesystem(fsys)
 	_, err = testFs.Stat("FOO")
 	if sensitive {
 		if IsNotExist(err) {
@@ -156,15 +156,16 @@ func testCaseFSStat(t *testing.T, fsys Filesystem) {
 
 func BenchmarkWalkCaseFakeFS100k(b *testing.B) {
 	const entries = 100_000
-	fsys, paths, err := fakefsForBenchmark(entries, 0)
+	fsys, paths, err := fakefsForTest(entries, 0)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Run("rawfs", func(b *testing.B) {
-		var fakefs *fakeFS
-		if ffs, ok := unwrapFilesystem(fsys, filesystemWrapperTypeNone); ok {
-			fakefs = ffs.(*fakeFS)
+		fakefs, ok := unwrapFilesystem[*fakeFS](fsys)
+		if !ok {
+			panic("expected unwrap to fakefs")
 		}
+
 		fakefs.resetCounters()
 		benchmarkWalkFakeFS(b, fsys, paths, 0, "")
 		fakefs.reportMetricsPerOp(b)
@@ -175,11 +176,15 @@ func BenchmarkWalkCaseFakeFS100k(b *testing.B) {
 		// Construct the casefs manually or it will get cached and the benchmark is invalid.
 		casefs := &caseFilesystem{
 			Filesystem: fsys,
-			realCaser:  newDefaultRealCaser(fsys),
+			realCaser: &defaultRealCaser{
+				fs:    fsys,
+				cache: newCaseCache(),
+			},
 		}
-		var fakefs *fakeFS
-		if ffs, ok := unwrapFilesystem(fsys, filesystemWrapperTypeNone); ok {
-			fakefs = ffs.(*fakeFS)
+
+		fakefs, ok := unwrapFilesystem[*fakeFS](fsys)
+		if !ok {
+			panic("expected unwrap to fakefs")
 		}
 		fakefs.resetCounters()
 		benchmarkWalkFakeFS(b, casefs, paths, 0, "")
@@ -201,12 +206,17 @@ func BenchmarkWalkCaseFakeFS100k(b *testing.B) {
 		// Construct the casefs manually or it will get cached and the benchmark is invalid.
 		casefs := &caseFilesystem{
 			Filesystem: fsys,
-			realCaser:  newDefaultRealCaser(fsys),
+			realCaser: &defaultRealCaser{
+				fs:    fsys,
+				cache: newCaseCache(),
+			},
 		}
-		var fakefs *fakeFS
-		if ffs, ok := unwrapFilesystem(fsys, filesystemWrapperTypeNone); ok {
-			fakefs = ffs.(*fakeFS)
+
+		fakefs, ok := unwrapFilesystem[*fakeFS](fsys)
+		if !ok {
+			panic("expected unwrap to fakefs")
 		}
+
 		fakefs.resetCounters()
 		benchmarkWalkFakeFS(b, casefs, paths, otherOpEvery, otherOpPath)
 		fakefs.reportMetricsPerOp(b)
@@ -242,7 +252,7 @@ func benchmarkWalkFakeFS(b *testing.B, fsys Filesystem, paths []string, otherOpE
 }
 
 func TestStressCaseFS(t *testing.T) {
-	// Exercise a bunch of paralell operations for stressing out race
+	// Exercise a bunch of parallel operations for stressing out race
 	// conditions in the realnamer cache etc.
 
 	const limit = 10 * time.Second
@@ -250,7 +260,7 @@ func TestStressCaseFS(t *testing.T) {
 		t.Skip("long test")
 	}
 
-	fsys, paths, err := fakefsForBenchmark(10_000, 0)
+	fsys, paths, err := fakefsForTest(10_000, 0, &OptionDetectCaseConflicts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,12 +300,10 @@ func doubleWalkFSWithOtherOps(fsys Filesystem, paths []string, otherOpEvery int,
 	if err := fsys.Walk("/", func(path string, info FileInfo, err error) error {
 		i++
 		if otherOpEvery != 0 && i%otherOpEvery == 0 {
-			// l.Infoln("AAA", otherOpPath)
 			if _, err := fsys.Lstat(otherOpPath); err != nil {
 				return err
 			}
 		}
-		// l.Infoln("CCC", path)
 		return err
 	}); err != nil {
 		return err
@@ -306,11 +314,9 @@ func doubleWalkFSWithOtherOps(fsys Filesystem, paths []string, otherOpEvery int,
 			i++
 			if otherOpEvery != 0 && i%otherOpEvery == 0 {
 				if _, err := fsys.Lstat(otherOpPath); err != nil {
-					// l.Infoln("AAA", otherOpPath)
 					return err
 				}
 			}
-			// l.Infoln("CCC", p)
 			if _, err := fsys.Lstat(p); err != nil {
 				return err
 			}
@@ -320,8 +326,8 @@ func doubleWalkFSWithOtherOps(fsys Filesystem, paths []string, otherOpEvery int,
 	return nil
 }
 
-func fakefsForBenchmark(nfiles int, latency time.Duration) (Filesystem, []string, error) {
-	fsys := NewFilesystem(FilesystemTypeFake, fmt.Sprintf("fakefsForBenchmark?files=%d&insens=true&latency=%s", nfiles, latency))
+func fakefsForTest(nfiles int, latency time.Duration, opts ...Option) (Filesystem, []string, error) {
+	fsys := NewFilesystem(FilesystemTypeFake, fmt.Sprintf("fakefsForBenchmark?files=%d&insens=true&latency=%s", nfiles, latency), opts...)
 
 	var paths []string
 	if err := fsys.Walk("/", func(path string, info FileInfo, err error) error {
@@ -334,7 +340,7 @@ func fakefsForBenchmark(nfiles int, latency time.Duration) (Filesystem, []string
 		return nil, nil, errors.New("didn't find enough stuff")
 	}
 
-	sort.Strings(paths)
+	slices.Sort(paths)
 
 	return fsys, paths, nil
 }

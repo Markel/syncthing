@@ -15,13 +15,24 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/protocol"
 )
+
+const FilesystemTypeFake FilesystemType = "fake"
+
+func init() {
+	RegisterFilesystemType(FilesystemTypeFake, func(root string, opts ...Option) (Filesystem, error) {
+		return newFakeFilesystem(root, opts...), nil
+	})
+}
 
 // see readShortAt()
 const randomBlockShift = 14 // 128k
@@ -29,19 +40,19 @@ const randomBlockShift = 14 // 128k
 // fakeFS is a fake filesystem for testing and benchmarking. It has the
 // following properties:
 //
-// - File metadata is kept in RAM. Specifically, we remember which files and
-//   directories exist, their dates, permissions and sizes. Symlinks are
-//   not supported.
+//   - File metadata is kept in RAM. Specifically, we remember which files and
+//     directories exist, their dates, permissions and sizes. Symlinks are
+//     not supported.
 //
-// - File contents are generated pseudorandomly with just the file name as
-//   seed. Writes are discarded, other than having the effect of increasing
-//   the file size. If you only write data that you've read from a file with
-//   the same name on a different fakeFS, you'll never know the difference...
+//   - File contents are generated pseudorandomly with just the file name as
+//     seed. Writes are discarded, other than having the effect of increasing
+//     the file size. If you only write data that you've read from a file with
+//     the same name on a different fakeFS, you'll never know the difference...
 //
 // - We totally ignore permissions - pretend you are root.
 //
-// - The root path can contain URL query-style parameters that pre populate
-//   the filesystem at creation with a certain amount of random data:
+//   - The root path can contain URL query-style parameters that pre populate
+//     the filesystem at creation with a certain amount of random data:
 //
 //     files=n    to generate n random files (default 0)
 //     maxsize=n  to generate files up to a total of n MiB (default 0)
@@ -49,17 +60,22 @@ const randomBlockShift = 14 // 128k
 //     seed=n     to set the initial random seed (default 0)
 //     insens=b   "true" makes filesystem case-insensitive Windows- or OSX-style (default false)
 //     latency=d  to set the amount of time each "disk" operation takes, where d is time.ParseDuration format
+//     content=true to save actual file contents instead of generating pseudorandomly; n.b. memory usage
+//     nostfolder=true skip the creation of .stfolder
+//     timeprecisionsecond=true Modification times are stored with only second precision
 //
 // - Two fakeFS:s pointing at the same root path see the same files.
-//
 type fakeFS struct {
-	counters    fakeFSCounters
-	uri         string
-	mut         sync.Mutex
-	root        *fakeEntry
-	insens      bool
-	withContent bool
-	latency     time.Duration
+	counters            fakeFSCounters
+	uri                 string
+	mut                 sync.Mutex
+	root                *fakeEntry
+	insens              bool
+	withContent         bool
+	timePrecisionSecond bool
+	latency             time.Duration
+	userCache           *userCache
+	groupCache          *groupCache
 }
 
 type fakeFSCounters struct {
@@ -104,10 +120,12 @@ func newFakeFilesystem(rootURI string, _ ...Option) *fakeFS {
 		root: &fakeEntry{
 			name:      "/",
 			entryType: fakeEntryTypeDir,
-			mode:      0700,
+			mode:      0o700,
 			mtime:     time.Now(),
 			children:  make(map[string]*fakeEntry),
 		},
+		userCache:  newValueCache(time.Hour, user.LookupId),
+		groupCache: newValueCache(time.Hour, user.LookupGroupId),
 	}
 
 	files, _ := strconv.Atoi(params.Get("files"))
@@ -117,6 +135,8 @@ func newFakeFilesystem(rootURI string, _ ...Option) *fakeFS {
 
 	fs.insens = params.Get("insens") == "true"
 	fs.withContent = params.Get("content") == "true"
+	nostfolder := params.Get("nostfolder") == "true"
+	fs.timePrecisionSecond = params.Get("timeprecisionsecond") == "true"
 
 	if sizeavg == 0 {
 		sizeavg = 1 << 20
@@ -127,28 +147,30 @@ func newFakeFilesystem(rootURI string, _ ...Option) *fakeFS {
 		// *look* like file I/O, but they are not. Do not worry that they
 		// might fail.
 
-		rng := rand.New(rand.NewSource(int64(seed)))
+		rng := rand.New(rand.NewSource(int64(seed))) //nolint:gosec
 		var createdFiles int
 		var writtenData int64
 		for (files == 0 || createdFiles < files) && (maxsize == 0 || writtenData>>20 < int64(maxsize)) {
 			dir := filepath.Join(fmt.Sprintf("%02x", rng.Intn(255)), fmt.Sprintf("%02x", rng.Intn(255)))
 			file := fmt.Sprintf("%016x", rng.Int63())
-			fs.MkdirAll(dir, 0755)
+			_ = fs.MkdirAll(dir, ModePerm)
 
 			fd, _ := fs.Create(filepath.Join(dir, file))
 			createdFiles++
 
 			fsize := int64(sizeavg/2 + rng.Intn(sizeavg))
-			fd.Truncate(fsize)
+			_ = fd.Truncate(fsize)
 			writtenData += fsize
 
 			ftime := time.Unix(1000000000+rng.Int63n(10*365*86400), 0)
-			fs.Chtimes(filepath.Join(dir, file), ftime, ftime)
+			_ = fs.Chtimes(filepath.Join(dir, file), ftime, ftime)
 		}
 	}
 
-	// Also create a default folder marker for good measure
-	fs.Mkdir(".stfolder", 0700)
+	if !nostfolder {
+		// Also create a default folder marker for good measure
+		_ = fs.Mkdir(".stfolder", ModePerm)
+	}
 
 	// We only set the latency after doing the operations required to create
 	// the filesystem initially.
@@ -181,7 +203,6 @@ type fakeEntry struct {
 }
 
 func (fs *fakeFS) entryForName(name string) *fakeEntry {
-	// bug: lookup doesn't work through symlinks.
 	if fs.insens {
 		name = UnicodeLowercaseNormalized(name)
 	}
@@ -194,7 +215,7 @@ func (fs *fakeFS) entryForName(name string) *fakeEntry {
 	name = strings.Trim(name, "/")
 	comps := strings.Split(name, "/")
 	entry := fs.root
-	for _, comp := range comps {
+	for i, comp := range comps {
 		if entry.entryType != fakeEntryTypeDir {
 			return nil
 		}
@@ -202,6 +223,12 @@ func (fs *fakeFS) entryForName(name string) *fakeEntry {
 		entry, ok = entry.children[comp]
 		if !ok {
 			return nil
+		}
+		if i < len(comps)-1 && entry.entryType == fakeEntryTypeSymlink {
+			// only absolute link targets are supported, and we assume
+			// lookup is Lstat-kind so we only resolve symlinks when they
+			// are not the last path component.
+			return fs.entryForName(entry.dest)
 		}
 	}
 	return entry
@@ -220,7 +247,7 @@ func (fs *fakeFS) Chmod(name string, mode FileMode) error {
 	return nil
 }
 
-func (fs *fakeFS) Lchown(name string, uid, gid int) error {
+func (fs *fakeFS) Lchown(name, uid, gid string) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
 	fs.counters.Lchown++
@@ -229,12 +256,12 @@ func (fs *fakeFS) Lchown(name string, uid, gid int) error {
 	if entry == nil {
 		return os.ErrNotExist
 	}
-	entry.uid = uid
-	entry.gid = gid
+	entry.uid, _ = strconv.Atoi(uid)
+	entry.gid, _ = strconv.Atoi(gid)
 	return nil
 }
 
-func (fs *fakeFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+func (fs *fakeFS) Chtimes(name string, _ time.Time, mtime time.Time) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
 	fs.counters.Chtimes++
@@ -242,6 +269,9 @@ func (fs *fakeFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	entry := fs.entryForName(name)
 	if entry == nil {
 		return os.ErrNotExist
+	}
+	if fs.timePrecisionSecond {
+		mtime = mtime.Truncate(time.Second)
 	}
 	entry.mtime = mtime
 	return nil
@@ -254,14 +284,15 @@ func (fs *fakeFS) create(name string) (*fakeEntry, error) {
 	time.Sleep(fs.latency)
 
 	if entry := fs.entryForName(name); entry != nil {
-		if entry.entryType == fakeEntryTypeDir {
+		switch entry.entryType {
+		case fakeEntryTypeDir:
 			return nil, os.ErrExist
-		} else if entry.entryType == fakeEntryTypeSymlink {
+		case fakeEntryTypeSymlink:
 			return nil, errors.New("following symlink not supported")
 		}
 		entry.size = 0
 		entry.mtime = time.Now()
-		entry.mode = 0666
+		entry.mode = 0o666
 		entry.content = nil
 		if fs.withContent {
 			entry.content = make([]byte, 0)
@@ -277,7 +308,7 @@ func (fs *fakeFS) create(name string) (*fakeEntry, error) {
 	}
 	new := &fakeEntry{
 		name:  base,
-		mode:  0666,
+		mode:  0o666,
 		mtime: time.Now(),
 	}
 
@@ -299,9 +330,9 @@ func (fs *fakeFS) Create(name string) (File, error) {
 		return nil, err
 	}
 	if fs.insens {
-		return &fakeFile{fakeEntry: entry, presentedName: filepath.Base(name)}, nil
+		return &fakeFile{fakeEntry: entry, presentedName: filepath.Base(name), mut: &fs.mut}, nil
 	}
-	return &fakeFile{fakeEntry: entry}, nil
+	return &fakeFile{fakeEntry: entry, mut: &fs.mut}, nil
 }
 
 func (fs *fakeFS) CreateSymlink(target, name string) error {
@@ -345,6 +376,8 @@ func (fs *fakeFS) Lstat(name string) (FileInfo, error) {
 	}
 
 	info := &fakeFileInfo{*entry}
+	info.content = nil
+	info.children = nil
 	if fs.insens {
 		info.name = filepath.Base(name)
 	}
@@ -435,9 +468,9 @@ func (fs *fakeFS) Open(name string) (File, error) {
 	}
 
 	if fs.insens {
-		return &fakeFile{fakeEntry: entry, presentedName: filepath.Base(name)}, nil
+		return &fakeFile{fakeEntry: entry, presentedName: filepath.Base(name), mut: &fs.mut}, nil
 	}
-	return &fakeFile{fakeEntry: entry}, nil
+	return &fakeFile{fakeEntry: entry, mut: &fs.mut}, nil
 }
 
 func (fs *fakeFS) OpenFile(name string, flags int, mode FileMode) (File, error) {
@@ -480,7 +513,7 @@ func (fs *fakeFS) OpenFile(name string, flags int, mode FileMode) (File, error) 
 	}
 
 	entry.children[key] = newEntry
-	return &fakeFile{fakeEntry: newEntry}, nil
+	return &fakeFile{fakeEntry: newEntry, mut: &fs.mut}, nil
 }
 
 func (fs *fakeFS) ReadSymlink(name string) (string, error) {
@@ -596,40 +629,66 @@ func (fs *fakeFS) Stat(name string) (FileInfo, error) {
 	return fs.Lstat(name)
 }
 
-func (fs *fakeFS) SymlinksSupported() bool {
-	return false
-}
-
-func (fs *fakeFS) Walk(name string, walkFn WalkFunc) error {
+func (*fakeFS) Walk(_ string, _ WalkFunc) error {
 	return errors.New("not implemented")
 }
 
-func (fs *fakeFS) Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, <-chan error, error) {
+func (*fakeFS) Watch(_ string, _ Matcher, _ context.Context, _ bool) (<-chan Event, <-chan error, error) {
 	return nil, nil, ErrWatchNotSupported
 }
 
-func (fs *fakeFS) Hide(name string) error {
+func (*fakeFS) Hide(_ string) error {
 	return nil
 }
 
-func (fs *fakeFS) Unhide(name string) error {
+func (*fakeFS) Unhide(_ string) error {
 	return nil
 }
 
+func (*fakeFS) GetXattr(_ string, _ XattrFilter) ([]protocol.Xattr, error) {
+	return nil, nil
+}
+
+func (*fakeFS) SetXattr(_ string, _ []protocol.Xattr, _ XattrFilter) error {
+	return nil
+}
+
+// A basic glob-implementation that should be able to handle
+// simple test cases.
 func (fs *fakeFS) Glob(pattern string) ([]string, error) {
-	// gnnh we don't seem to actually require this in practice
-	return nil, errors.New("not implemented")
+	dir := filepath.Dir(pattern)
+	file := filepath.Base(pattern)
+	if _, err := fs.Lstat(dir); err != nil {
+		return nil, errPathInvalid
+	}
+
+	var matches []string
+	names, err := fs.DirNames(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, n := range names {
+		matched, err := filepath.Match(file, n)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			matches = append(matches, filepath.Join(dir, n))
+		}
+	}
+	return matches, err
 }
 
-func (fs *fakeFS) Roots() ([]string, error) {
+func (*fakeFS) Roots() ([]string, error) {
 	return []string{"/"}, nil
 }
 
-func (fs *fakeFS) Usage(name string) (Usage, error) {
+func (*fakeFS) Usage(_ string) (Usage, error) {
 	return Usage{}, errors.New("not implemented")
 }
 
-func (fs *fakeFS) Type() FilesystemType {
+func (*fakeFS) Type() FilesystemType {
 	return FilesystemTypeFake
 }
 
@@ -637,7 +696,7 @@ func (fs *fakeFS) URI() string {
 	return fs.uri
 }
 
-func (fs *fakeFS) Options() []Option {
+func (*fakeFS) Options() []Option {
 	return nil
 }
 
@@ -656,12 +715,12 @@ func (fs *fakeFS) SameFile(fi1, fi2 FileInfo) bool {
 	return ok && fi1.ModTime().Equal(fi2.ModTime()) && fi1.Mode() == fi2.Mode() && fi1.IsDir() == fi2.IsDir() && fi1.IsRegular() == fi2.IsRegular() && fi1.IsSymlink() == fi2.IsSymlink() && fi1.Owner() == fi2.Owner() && fi1.Group() == fi2.Group()
 }
 
-func (fs *fakeFS) underlying() (Filesystem, bool) {
-	return nil, false
+func (fs *fakeFS) PlatformData(name string, scanOwnership, scanXattrs bool, xattrFilter XattrFilter) (protocol.PlatformData, error) {
+	return unixPlatformData(fs, name, fs.userCache, fs.groupCache, scanOwnership, scanXattrs, xattrFilter)
 }
 
-func (fs *fakeFS) wrapperType() filesystemWrapperType {
-	return filesystemWrapperTypeNone
+func (*fakeFS) underlying() (Filesystem, bool) {
+	return nil, false
 }
 
 func (fs *fakeFS) resetCounters() {
@@ -671,6 +730,7 @@ func (fs *fakeFS) resetCounters() {
 }
 
 func (fs *fakeFS) reportMetricsPerOp(b *testing.B) {
+	b.Helper()
 	fs.reportMetricsPer(b, 1, "op")
 }
 
@@ -685,7 +745,8 @@ func (fs *fakeFS) reportMetricsPer(b *testing.B, divisor float64, unit string) {
 // opened for reading or writing, it's all good.
 type fakeFile struct {
 	*fakeEntry
-	mut           sync.Mutex
+
+	mut           *sync.Mutex
 	rng           io.Reader
 	seed          int64
 	offset        int64
@@ -693,7 +754,7 @@ type fakeFile struct {
 	presentedName string // present (i.e. != "") on insensitive fs only
 }
 
-func (f *fakeFile) Close() error {
+func (*fakeFile) Close() error {
 	return nil
 }
 
@@ -769,7 +830,7 @@ func (f *fakeFile) readShortAt(p []byte, offs int64) (int, error) {
 	if f.seed == 0 {
 		hf := fnv.New64()
 		hf.Write([]byte(f.name))
-		f.seed = int64(hf.Sum64())
+		f.seed = int64(hf.Sum64()) //nolint:gosec
 	}
 
 	// Check whether the read is a continuation of an RNG we already have or
@@ -779,14 +840,14 @@ func (f *fakeFile) readShortAt(p []byte, offs int64) (int, error) {
 	nextBlockOffs := (seedNo + 1) << randomBlockShift
 	if f.rng == nil || f.offset != offs || seedNo != f.seedOffs {
 		// This is not a straight read continuing from a previous one
-		f.rng = rand.New(rand.NewSource(f.seed + seedNo))
+		f.rng = rand.New(rand.NewSource(f.seed + seedNo)) //nolint:gosec
 
 		// If the read is not at the start of the block, discard data
 		// accordingly.
 		diff := offs - minOffs
 		if diff > 0 {
 			lr := io.LimitReader(f.rng, diff)
-			io.Copy(io.Discard, lr)
+			_, _ = io.Copy(io.Discard, lr)
 		}
 
 		f.offset = offs
@@ -874,6 +935,8 @@ func (f *fakeFile) Name() string {
 	if f.presentedName != "" {
 		return f.presentedName
 	}
+	f.mut.Lock()
+	defer f.mut.Unlock()
 	return f.name
 }
 
@@ -899,7 +962,9 @@ func (f *fakeFile) Truncate(size int64) error {
 }
 
 func (f *fakeFile) Stat() (FileInfo, error) {
+	f.mut.Lock()
 	info := &fakeFileInfo{*f.fakeEntry}
+	f.mut.Unlock()
 	if f.presentedName != "" {
 		info.name = f.presentedName
 	}
@@ -907,7 +972,7 @@ func (f *fakeFile) Stat() (FileInfo, error) {
 	return info, nil
 }
 
-func (f *fakeFile) Sync() error {
+func (*fakeFile) Sync() error {
 	return nil
 }
 
@@ -950,4 +1015,8 @@ func (f *fakeFileInfo) Owner() int {
 
 func (f *fakeFileInfo) Group() int {
 	return f.gid
+}
+
+func (*fakeFileInfo) Sys() any {
+	return nil
 }

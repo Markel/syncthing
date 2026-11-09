@@ -40,6 +40,16 @@ type Wrapper struct {
 	defaultFolderReturnsOnCall map[int]struct {
 		result1 config.FolderConfiguration
 	}
+	DefaultIgnoresStub        func() config.Ignores
+	defaultIgnoresMutex       sync.RWMutex
+	defaultIgnoresArgsForCall []struct {
+	}
+	defaultIgnoresReturns struct {
+		result1 config.Ignores
+	}
+	defaultIgnoresReturnsOnCall map[int]struct {
+		result1 config.Ignores
+	}
 	DeviceStub        func(protocol.DeviceID) (config.DeviceConfiguration, bool)
 	deviceMutex       sync.RWMutex
 	deviceArgsForCall []struct {
@@ -446,6 +456,59 @@ func (fake *Wrapper) DefaultFolderReturnsOnCall(i int, result1 config.FolderConf
 	}
 	fake.defaultFolderReturnsOnCall[i] = struct {
 		result1 config.FolderConfiguration
+	}{result1}
+}
+
+func (fake *Wrapper) DefaultIgnores() config.Ignores {
+	fake.defaultIgnoresMutex.Lock()
+	ret, specificReturn := fake.defaultIgnoresReturnsOnCall[len(fake.defaultIgnoresArgsForCall)]
+	fake.defaultIgnoresArgsForCall = append(fake.defaultIgnoresArgsForCall, struct {
+	}{})
+	stub := fake.DefaultIgnoresStub
+	fakeReturns := fake.defaultIgnoresReturns
+	fake.recordInvocation("DefaultIgnores", []interface{}{})
+	fake.defaultIgnoresMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *Wrapper) DefaultIgnoresCallCount() int {
+	fake.defaultIgnoresMutex.RLock()
+	defer fake.defaultIgnoresMutex.RUnlock()
+	return len(fake.defaultIgnoresArgsForCall)
+}
+
+func (fake *Wrapper) DefaultIgnoresCalls(stub func() config.Ignores) {
+	fake.defaultIgnoresMutex.Lock()
+	defer fake.defaultIgnoresMutex.Unlock()
+	fake.DefaultIgnoresStub = stub
+}
+
+func (fake *Wrapper) DefaultIgnoresReturns(result1 config.Ignores) {
+	fake.defaultIgnoresMutex.Lock()
+	defer fake.defaultIgnoresMutex.Unlock()
+	fake.DefaultIgnoresStub = nil
+	fake.defaultIgnoresReturns = struct {
+		result1 config.Ignores
+	}{result1}
+}
+
+func (fake *Wrapper) DefaultIgnoresReturnsOnCall(i int, result1 config.Ignores) {
+	fake.defaultIgnoresMutex.Lock()
+	defer fake.defaultIgnoresMutex.Unlock()
+	fake.DefaultIgnoresStub = nil
+	if fake.defaultIgnoresReturnsOnCall == nil {
+		fake.defaultIgnoresReturnsOnCall = make(map[int]struct {
+			result1 config.Ignores
+		})
+	}
+	fake.defaultIgnoresReturnsOnCall[i] = struct {
+		result1 config.Ignores
 	}{result1}
 }
 
@@ -1746,58 +1809,6 @@ func (fake *Wrapper) UnsubscribeArgsForCall(i int) config.Committer {
 func (fake *Wrapper) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
-	fake.configPathMutex.RLock()
-	defer fake.configPathMutex.RUnlock()
-	fake.defaultDeviceMutex.RLock()
-	defer fake.defaultDeviceMutex.RUnlock()
-	fake.defaultFolderMutex.RLock()
-	defer fake.defaultFolderMutex.RUnlock()
-	fake.deviceMutex.RLock()
-	defer fake.deviceMutex.RUnlock()
-	fake.deviceListMutex.RLock()
-	defer fake.deviceListMutex.RUnlock()
-	fake.devicesMutex.RLock()
-	defer fake.devicesMutex.RUnlock()
-	fake.folderMutex.RLock()
-	defer fake.folderMutex.RUnlock()
-	fake.folderListMutex.RLock()
-	defer fake.folderListMutex.RUnlock()
-	fake.folderPasswordsMutex.RLock()
-	defer fake.folderPasswordsMutex.RUnlock()
-	fake.foldersMutex.RLock()
-	defer fake.foldersMutex.RUnlock()
-	fake.gUIMutex.RLock()
-	defer fake.gUIMutex.RUnlock()
-	fake.ignoredDeviceMutex.RLock()
-	defer fake.ignoredDeviceMutex.RUnlock()
-	fake.ignoredDevicesMutex.RLock()
-	defer fake.ignoredDevicesMutex.RUnlock()
-	fake.ignoredFolderMutex.RLock()
-	defer fake.ignoredFolderMutex.RUnlock()
-	fake.lDAPMutex.RLock()
-	defer fake.lDAPMutex.RUnlock()
-	fake.modifyMutex.RLock()
-	defer fake.modifyMutex.RUnlock()
-	fake.myIDMutex.RLock()
-	defer fake.myIDMutex.RUnlock()
-	fake.optionsMutex.RLock()
-	defer fake.optionsMutex.RUnlock()
-	fake.rawCopyMutex.RLock()
-	defer fake.rawCopyMutex.RUnlock()
-	fake.removeDeviceMutex.RLock()
-	defer fake.removeDeviceMutex.RUnlock()
-	fake.removeFolderMutex.RLock()
-	defer fake.removeFolderMutex.RUnlock()
-	fake.requiresRestartMutex.RLock()
-	defer fake.requiresRestartMutex.RUnlock()
-	fake.saveMutex.RLock()
-	defer fake.saveMutex.RUnlock()
-	fake.serveMutex.RLock()
-	defer fake.serveMutex.RUnlock()
-	fake.subscribeMutex.RLock()
-	defer fake.subscribeMutex.RUnlock()
-	fake.unsubscribeMutex.RLock()
-	defer fake.unsubscribeMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value

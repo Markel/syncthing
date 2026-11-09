@@ -9,34 +9,38 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/syncthing/syncthing/lib/build"
 )
+
+const FilesystemTypeBasic FilesystemType = "basic"
 
 var (
 	errInvalidFilenameEmpty               = errors.New("name is invalid, must not be empty")
 	errInvalidFilenameWindowsSpacePeriod  = errors.New("name is invalid, must not end in space or period on Windows")
-	errInvalidFilenameWindowsReservedName = errors.New("name is invalid, contains Windows reserved name (NUL, COM1, etc.)")
-	errInvalidFilenameWindowsReservedChar = errors.New("name is invalid, contains Windows reserved character (?, *, etc.)")
-	errNotRelative                        = errors.New("not a relative path")
+	errInvalidFilenameWindowsReservedName = errors.New("name is invalid, contains Windows reserved name")
+	errInvalidFilenameWindowsReservedChar = errors.New("name is invalid, contains Windows reserved character")
 )
 
 type OptionJunctionsAsDirs struct{}
 
-func (o *OptionJunctionsAsDirs) apply(fs Filesystem) {
+func (*OptionJunctionsAsDirs) apply(fs Filesystem) Filesystem {
 	if basic, ok := fs.(*BasicFilesystem); !ok {
-		l.Warnln("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
+		slog.Warn("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
 	} else {
 		basic.junctionsAsDirs = true
 	}
+	return fs
 }
 
-func (o *OptionJunctionsAsDirs) String() string {
+func (*OptionJunctionsAsDirs) String() string {
 	return "junctionsAsDirs"
 }
 
@@ -46,6 +50,19 @@ type BasicFilesystem struct {
 	root            string
 	junctionsAsDirs bool
 	options         []Option
+	userCache       *userCache
+	groupCache      *groupCache
+}
+
+type (
+	userCache  = valueCache[string, *user.User]
+	groupCache = valueCache[string, *user.Group]
+)
+
+func init() {
+	RegisterFilesystemType(FilesystemTypeBasic, func(root string, opts ...Option) (Filesystem, error) {
+		return newBasicFilesystem(root, opts...), nil
+	})
 }
 
 func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
@@ -56,11 +73,11 @@ func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
 	// The reason it's done like this:
 	// C:          ->  C:\            ->  C:\        (issue that this is trying to fix)
 	// C:\somedir  ->  C:\somedir\    ->  C:\somedir
-	// C:\somedir\ ->  C:\somedir\\   ->  C:\somedir
+	// C:\somedir\ ->  C:\somedir\    ->  C:\somedir
 	// This way in the tests, we get away without OS specific separators
 	// in the test configs.
 	sep := string(filepath.Separator)
-	root = filepath.Dir(root + sep)
+	root = filepath.Clean(filepath.Dir(root + sep))
 
 	// Attempt tilde expansion; leave unchanged in case of error
 	if path, err := ExpandTilde(root); err == nil {
@@ -79,13 +96,15 @@ func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
 
 	// Attempt to enable long filename support on Windows. We may still not
 	// have an absolute path here if the previous steps failed.
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		root = longFilenameSupport(root)
 	}
 
 	fs := &BasicFilesystem{
-		root:    root,
-		options: opts,
+		root:       root,
+		options:    opts,
+		userCache:  newValueCache(time.Hour, user.LookupId),
+		groupCache: newValueCache(time.Hour, user.LookupGroupId),
 	}
 	for _, opt := range opts {
 		opt.apply(fs)
@@ -129,14 +148,6 @@ func (f *BasicFilesystem) Chmod(name string, mode FileMode) error {
 	return os.Chmod(name, os.FileMode(mode))
 }
 
-func (f *BasicFilesystem) Lchown(name string, uid, gid int) error {
-	name, err := f.rooted(name)
-	if err != nil {
-		return err
-	}
-	return os.Lchown(name, uid, gid)
-}
-
 func (f *BasicFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	name, err := f.rooted(name)
 	if err != nil {
@@ -163,7 +174,7 @@ func (f *BasicFilesystem) MkdirAll(path string, perm FileMode) error {
 		return err
 	}
 
-	return f.mkdirAll(path, os.FileMode(perm))
+	return os.MkdirAll(path, os.FileMode(perm))
 }
 
 func (f *BasicFilesystem) Lstat(name string) (FileInfo, error) {
@@ -176,14 +187,6 @@ func (f *BasicFilesystem) Lstat(name string) (FileInfo, error) {
 		return nil, err
 	}
 	return basicFileInfo{fi}, err
-}
-
-func (f *BasicFilesystem) Remove(name string) error {
-	name, err := f.rooted(name)
-	if err != nil {
-		return err
-	}
-	return os.Remove(name)
 }
 
 func (f *BasicFilesystem) RemoveAll(name string) error {
@@ -223,7 +226,7 @@ func (f *BasicFilesystem) DirNames(name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	fd, err := os.OpenFile(name, OptReadOnly, 0777)
+	fd, err := os.OpenFile(name, OptReadOnly, 0o777)
 	if err != nil {
 		return nil, err
 	}
@@ -237,22 +240,23 @@ func (f *BasicFilesystem) DirNames(name string) ([]string, error) {
 	return names, nil
 }
 
+// Open opens the file for reading, while not following symlinks
 func (f *BasicFilesystem) Open(name string) (File, error) {
-	rootedName, err := f.rooted(name)
-	if err != nil {
-		return nil, err
-	}
-	fd, err := os.Open(rootedName)
-	if err != nil {
-		return nil, err
-	}
-	return basicFile{fd, name}, err
+	return f.OpenFile(name, os.O_RDONLY, 0)
 }
 
+// OpenFile is the generalised file open call, using the flags to determine
+// the open semantics. We always add O_NOFOLLOW, disallowing opening files
+// by following symlinks, unless OptFollow is set.
 func (f *BasicFilesystem) OpenFile(name string, flags int, mode FileMode) (File, error) {
 	rootedName, err := f.rooted(name)
 	if err != nil {
 		return nil, err
+	}
+	if flags&OptFollow != 0 {
+		flags &^= OptFollow // unset the synthetic OptFollow bit
+	} else {
+		flags |= optNoFollow
 	}
 	fd, err := os.OpenFile(rootedName, flags, os.FileMode(mode))
 	if err != nil {
@@ -261,19 +265,13 @@ func (f *BasicFilesystem) OpenFile(name string, flags int, mode FileMode) (File,
 	return basicFile{fd, name}, err
 }
 
+// Create opens a file for writing, creating it as required. The Create will
+// fail if the destination is a symlink.
 func (f *BasicFilesystem) Create(name string) (File, error) {
-	rootedName, err := f.rooted(name)
-	if err != nil {
-		return nil, err
-	}
-	fd, err := os.Create(rootedName)
-	if err != nil {
-		return nil, err
-	}
-	return basicFile{fd, name}, err
+	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 }
 
-func (f *BasicFilesystem) Walk(root string, walkFn WalkFunc) error {
+func (*BasicFilesystem) Walk(_ string, _ WalkFunc) error {
 	// implemented in WalkFilesystem
 	return errors.New("not implemented")
 }
@@ -306,7 +304,7 @@ func (f *BasicFilesystem) Usage(name string) (Usage, error) {
 	}, nil
 }
 
-func (f *BasicFilesystem) Type() FilesystemType {
+func (*BasicFilesystem) Type() FilesystemType {
 	return FilesystemTypeBasic
 }
 
@@ -318,7 +316,7 @@ func (f *BasicFilesystem) Options() []Option {
 	return f.options
 }
 
-func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
+func (*BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 	// Like os.SameFile, we always return false unless fi1 and fi2 were created
 	// by this package's Stat/Lstat method.
 	f1, ok1 := fi1.(basicFileInfo)
@@ -330,17 +328,14 @@ func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 	return os.SameFile(f1.osFileInfo(), f2.osFileInfo())
 }
 
-func (f *BasicFilesystem) underlying() (Filesystem, bool) {
+func (*BasicFilesystem) underlying() (Filesystem, bool) {
 	return nil, false
-}
-
-func (f *BasicFilesystem) wrapperType() filesystemWrapperType {
-	return filesystemWrapperTypeNone
 }
 
 // basicFile implements the fs.File interface on top of an os.File
 type basicFile struct {
 	*os.File
+
 	name string
 }
 
@@ -381,12 +376,12 @@ func longFilenameSupport(path string) string {
 	return path
 }
 
-type ErrWatchEventOutsideRoot struct{ msg string }
+type WatchEventOutsideRootError struct{ msg string }
 
-func (e *ErrWatchEventOutsideRoot) Error() string {
+func (e *WatchEventOutsideRootError) Error() string {
 	return e.msg
 }
 
-func (f *BasicFilesystem) newErrWatchEventOutsideRoot(absPath string, roots []string) *ErrWatchEventOutsideRoot {
-	return &ErrWatchEventOutsideRoot{fmt.Sprintf("Watching for changes encountered an event outside of the filesystem root: f.root==%v, roots==%v, path==%v. This should never happen, please report this message to forum.syncthing.net.", f.root, roots, absPath)}
+func (f *BasicFilesystem) newErrWatchEventOutsideRoot(absPath string, roots []string) *WatchEventOutsideRootError {
+	return &WatchEventOutsideRootError{fmt.Sprintf("Watching for changes encountered an event outside of the filesystem root: f.root==%v, roots==%v, path==%v. This should never happen, please report this message to forum.syncthing.net.", f.root, roots, absPath)}
 }

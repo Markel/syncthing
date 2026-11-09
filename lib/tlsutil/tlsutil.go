@@ -8,27 +8,40 @@ package tlsutil
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
-	"github.com/pkg/errors"
-
+	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/rand"
 )
 
-var (
-	ErrIdentificationFailed = errors.New("failed to identify socket type")
-)
+// ShortLivedHTTPClient is used for infrequent HTTP requests. It supports
+// HTTP/2, but closes connections instead of keeping them around while idle.
+var ShortLivedHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:       dialer.DialContext,
+		Proxy:             http.ProxyFromEnvironment,
+		DisableKeepAlives: true,
+		ForceAttemptHTTP2: true,
+		TLSClientConfig:   SecureDefaultWithTLS12(),
+	},
+}
 
 var (
+	ErrIdentificationFailed = errors.New("failed to identify socket type")
+
 	// The list of cipher suites we will use / suggest for TLS 1.2 connections.
 	cipherSuites = []uint16{
 		// Suites that are good and fast on hardware *without* AES-NI.
@@ -64,7 +77,8 @@ var (
 func SecureDefaultTLS13() *tls.Config {
 	return &tls.Config{
 		// TLS 1.3 is the minimum we accept
-		MinVersion: tls.VersionTLS13,
+		MinVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 	}
 }
 
@@ -83,14 +97,37 @@ func SecureDefaultWithTLS12() *tls.Config {
 		// We've put some thought into this choice and would like it to
 		// matter.
 		PreferServerCipherSuites: true,
+		// We support HTTP/2 and HTTP/1.1
+		NextProtos: []string{"h2", "http/1.1"},
+
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 	}
 }
 
-// generateCertificate generates a PEM formatted key pair and self-signed certificate in memory.
-func generateCertificate(commonName string, lifetimeDays int) (*pem.Block, *pem.Block, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+// generateCertificate generates a PEM formatted key pair and self-signed
+// certificate in memory. The compatible flag indicates whether we aim for
+// compatibility (browsers) or maximum efficiency/security (sync
+// connections).
+func generateCertificate(commonName string, lifetimeDays int, compatible bool) (*pem.Block, *pem.Block, error) {
+	var pub, priv any
+	var err error
+	var sigAlgo x509.SignatureAlgorithm
+	if compatible {
+		// For browser connections we prefer ECDSA-P256
+		sigAlgo = x509.ECDSAWithSHA256
+		var pk *ecdsa.PrivateKey
+		pk, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err == nil {
+			priv = pk
+			pub = pk.Public()
+		}
+	} else {
+		// For sync connections we use Ed25519
+		sigAlgo = x509.PureEd25519
+		pub, priv, err = ed25519.GenerateKey(rand.Reader)
+	}
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "generate key")
+		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
 
 	notBefore := time.Now().Truncate(24 * time.Hour)
@@ -109,61 +146,65 @@ func generateCertificate(commonName string, lifetimeDays int) (*pem.Block, *pem.
 		DNSNames:              []string{commonName},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		SignatureAlgorithm:    x509.ECDSAWithSHA256,
+		SignatureAlgorithm:    sigAlgo,
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(priv), priv)
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, priv)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "create cert")
+		return nil, nil, fmt.Errorf("create cert: %w", err)
 	}
 
 	certBlock := &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}
 	keyBlock, err := pemBlockForKey(priv)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "save key")
+		return nil, nil, fmt.Errorf("save key: %w", err)
 	}
 
 	return certBlock, keyBlock, nil
 }
 
-// NewCertificate generates and returns a new TLS certificate, saved to the given PEM files.
-func NewCertificate(certFile, keyFile string, commonName string, lifetimeDays int) (tls.Certificate, error) {
-	certBlock, keyBlock, err := generateCertificate(commonName, lifetimeDays)
+// NewCertificate generates and returns a new TLS certificate, saved to the
+// given PEM files. The compatible flag indicates whether we aim for
+// compatibility (browsers) or maximum efficiency/security (sync
+// connections).
+func NewCertificate(certFile, keyFile string, commonName string, lifetimeDays int, compatible bool) (tls.Certificate, error) {
+	certBlock, keyBlock, err := generateCertificate(commonName, lifetimeDays, compatible)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
 	certOut, err := os.Create(certFile)
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "save cert")
+		return tls.Certificate{}, fmt.Errorf("save cert: %w", err)
 	}
 	if err = pem.Encode(certOut, certBlock); err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "save cert")
+		return tls.Certificate{}, fmt.Errorf("save cert: %w", err)
 	}
 	if err = certOut.Close(); err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "save cert")
+		return tls.Certificate{}, fmt.Errorf("save cert: %w", err)
 	}
 
-	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "save key")
+		return tls.Certificate{}, fmt.Errorf("save key: %w", err)
 	}
 	if err = pem.Encode(keyOut, keyBlock); err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "save key")
+		return tls.Certificate{}, fmt.Errorf("save key: %w", err)
 	}
 	if err = keyOut.Close(); err != nil {
-		return tls.Certificate{}, errors.Wrap(err, "save key")
+		return tls.Certificate{}, fmt.Errorf("save key: %w", err)
 	}
 
 	return tls.X509KeyPair(pem.EncodeToMemory(certBlock), pem.EncodeToMemory(keyBlock))
 }
 
-// NewCertificateInMemory generates and returns a new TLS certificate, kept only in memory.
+// NewCertificateInMemory generates and returns a new TLS certificate, kept
+// only in memory.
 func NewCertificateInMemory(commonName string, lifetimeDays int) (tls.Certificate, error) {
-	certBlock, keyBlock, err := generateCertificate(commonName, lifetimeDays)
+	certBlock, keyBlock, err := generateCertificate(commonName, lifetimeDays, false)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -173,6 +214,7 @@ func NewCertificateInMemory(commonName string, lifetimeDays int) (tls.Certificat
 
 type DowngradingListener struct {
 	net.Listener
+
 	TLSConfig *tls.Config
 }
 
@@ -181,7 +223,7 @@ func (l *DowngradingListener) Accept() (net.Conn, error) {
 
 	// We failed to identify the socket type, pretend that everything is fine,
 	// and pass it to the underlying handler, and let them deal with it.
-	if err == ErrIdentificationFailed {
+	if errors.Is(err, ErrIdentificationFailed) {
 		return conn, nil
 	}
 
@@ -217,9 +259,10 @@ func (l *DowngradingListener) AcceptNoWrapTLS() (net.Conn, bool, error) {
 }
 
 type UnionedConnection struct {
+	net.Conn
+
 	first     [1]byte
 	firstDone bool
-	net.Conn
 }
 
 func (c *UnionedConnection) Read(b []byte) (n int, err error) {
@@ -235,18 +278,7 @@ func (c *UnionedConnection) Read(b []byte) (n int, err error) {
 	return c.Conn.Read(b)
 }
 
-func publicKey(priv interface{}) interface{} {
-	switch k := priv.(type) {
-	case *rsa.PrivateKey:
-		return &k.PublicKey
-	case *ecdsa.PrivateKey:
-		return &k.PublicKey
-	default:
-		return nil
-	}
-}
-
-func pemBlockForKey(priv interface{}) (*pem.Block, error) {
+func pemBlockForKey(priv any) (*pem.Block, error) {
 	switch k := priv.(type) {
 	case *rsa.PrivateKey:
 		return &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}, nil
@@ -256,7 +288,13 @@ func pemBlockForKey(priv interface{}) (*pem.Block, error) {
 			return nil, err
 		}
 		return &pem.Block{Type: "EC PRIVATE KEY", Bytes: b}, nil
+	case ed25519.PrivateKey:
+		bs, err := x509.MarshalPKCS8PrivateKey(k)
+		if err != nil {
+			return nil, err
+		}
+		return &pem.Block{Type: "PRIVATE KEY", Bytes: bs}, nil
 	default:
-		return nil, errors.New("unknown key type")
+		return nil, fmt.Errorf("unknown key type: %T", priv)
 	}
 }

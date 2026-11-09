@@ -8,18 +8,33 @@ package protocol
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
-	"sync"
 	"testing"
 
+	"github.com/syncthing/syncthing/internal/gen/bep"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/sha256"
+	"github.com/syncthing/syncthing/lib/testutil"
+)
+
+var (
+	testKeyGen = NewKeyGenerator()
+
+	// https://github.com/syncthing/syncthing/issues/8799
+	cryptoIsBrokenUnderRaceDetector = (build.IsLinux || build.IsDarwin) && strings.HasPrefix(runtime.Version(), "go1.20")
 )
 
 func TestEnDecryptName(t *testing.T) {
+	if cryptoIsBrokenUnderRaceDetector {
+		t.Skip("cannot test")
+	}
+
 	pattern := regexp.MustCompile(
 		fmt.Sprintf("^[0-9A-V]%s/[0-9A-V]{2}/([0-9A-V]{%d}/)*[0-9A-V]{1,%d}$",
 			regexp.QuoteMeta(encryptedDirExtension),
@@ -45,7 +60,7 @@ func TestEnDecryptName(t *testing.T) {
 	}
 	for _, tc := range cases {
 		var prev string
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			enc := encryptName(tc, &key)
 			if prev != "" && prev != enc {
 				t.Error("name should always encrypt the same")
@@ -72,13 +87,13 @@ func TestEnDecryptName(t *testing.T) {
 }
 
 func TestKeyDerivation(t *testing.T) {
-	folderKey := KeyFromPassword("my folder", "my password")
+	folderKey := testKeyGen.KeyFromPassword("my folder", "my password")
 	encryptedName := encryptDeterministic([]byte("filename.txt"), folderKey, nil)
 	if base32Hex.EncodeToString(encryptedName) != "3T5957I4IOA20VEIEER6JSQG0PEPIRV862II3K7LOF75Q" {
 		t.Error("encrypted name mismatch")
 	}
 
-	fileKey := FileKey("filename.txt", folderKey)
+	fileKey := testKeyGen.FileKey("filename.txt", folderKey)
 	// fmt.Println(base32Hex.EncodeToString(encryptBytes([]byte("hello world"), fileKey))) => A1IPD...
 	const encrypted = `A1IPD28ISL7VNPRSSSQM2L31L3IJPC08283RO89J5UG0TI9P38DO9RFGK12DK0KD7PKQP6U51UL2B6H96O`
 	bs, _ := base32Hex.DecodeString(encrypted)
@@ -113,7 +128,7 @@ func TestEnDecryptBytes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		var prev []byte
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			enc := encryptBytes(tc, &key)
 			if bytes.Equal(enc, prev) {
 				t.Error("encryption should not repeat")
@@ -137,7 +152,7 @@ func encFileInfo() FileInfo {
 	return FileInfo{
 		Name:        "hello",
 		Size:        45,
-		Permissions: 0755,
+		Permissions: 0o755,
 		ModifiedS:   8080,
 		Sequence:    1000,
 		Blocks: []BlockInfo{
@@ -156,10 +171,14 @@ func encFileInfo() FileInfo {
 }
 
 func TestEnDecryptFileInfo(t *testing.T) {
+	if cryptoIsBrokenUnderRaceDetector {
+		t.Skip("cannot test")
+	}
+
 	var key [32]byte
 	fi := encFileInfo()
 
-	enc := encryptFileInfo(fi, &key)
+	enc := encryptFileInfo(testKeyGen, fi, &key)
 	if bytes.Equal(enc.Blocks[0].Hash, enc.Blocks[1].Hash) {
 		t.Error("block hashes should not repeat when on different offsets")
 	}
@@ -169,7 +188,7 @@ func TestEnDecryptFileInfo(t *testing.T) {
 	if enc.Sequence != fi.Sequence {
 		t.Error("encrypted fileinfo didn't maintain sequence number")
 	}
-	again := encryptFileInfo(fi, &key)
+	again := encryptFileInfo(testKeyGen, fi, &key)
 	if !bytes.Equal(enc.Blocks[0].Hash, again.Blocks[0].Hash) {
 		t.Error("block hashes should remain stable (0)")
 	}
@@ -180,7 +199,7 @@ func TestEnDecryptFileInfo(t *testing.T) {
 	// Simulate the remote setting the sequence number when writing to db
 	enc.Sequence = 10
 
-	dec, err := DecryptFileInfo(enc, &key)
+	dec, err := DecryptFileInfo(testKeyGen, enc, &key)
 	if err != nil {
 		t.Error(err)
 	}
@@ -194,6 +213,10 @@ func TestEnDecryptFileInfo(t *testing.T) {
 }
 
 func TestEncryptedFileInfoConsistency(t *testing.T) {
+	if cryptoIsBrokenUnderRaceDetector {
+		t.Skip("cannot test")
+	}
+
 	var key [32]byte
 	files := []FileInfo{
 		encFileInfo(),
@@ -201,7 +224,7 @@ func TestEncryptedFileInfoConsistency(t *testing.T) {
 	}
 	files[1].SetIgnored()
 	for i, f := range files {
-		enc := encryptFileInfo(f, &key)
+		enc := encryptFileInfo(testKeyGen, f, &key)
 		if err := checkFileInfoConsistency(enc); err != nil {
 			t.Errorf("%v: %v", i, err)
 		}
@@ -236,21 +259,62 @@ func TestIsEncryptedParent(t *testing.T) {
 	}
 }
 
-var benchmarkFileKey struct {
-	key [keySize]byte
-	sync.Once
+func TestEncryptedRequestInvalidOffset(t *testing.T) {
+	var key [keySize]byte
+	e := newEncryptedModel(nil, testKeyGen)
+	e.folderKeys.keys["folder"] = &key
+	for _, tc := range []struct {
+		offset int64
+		block  int
+	}{
+		{-1, 0},
+		{0, 1},
+		{0, -1},
+		{0, int(^uint(0) >> 1)},
+	} {
+		_, err := e.Request(&Request{
+			Folder: "folder", Name: encryptName("file", &key),
+			Size: minPaddedSize + blockOverhead, Offset: tc.offset, BlockNo: tc.block,
+		})
+		if _, ok := errors.AsType[protocolError](err); !ok {
+			t.Fatalf("offset %d block %d: expected protocol error, got %v", tc.offset, tc.block, err)
+		}
+	}
 }
 
-func BenchmarkFileKey(b *testing.B) {
-	benchmarkFileKey.Do(func() {
-		sha256.SelectAlgo()
-		rand.Read(benchmarkFileKey.key[:])
-	})
+func TestDecryptInvalidFileInfo(t *testing.T) {
+	var key [keySize]byte
+	for _, fi := range []FileInfo{
+		{Name: "file", Type: FileInfoType(-1)},
+		{Name: "../file", Type: FileInfoTypeDirectory},
+	} {
+		enc := encryptFileInfo(testKeyGen, fi, &key)
+		_, err := DecryptFileInfo(testKeyGen, enc, &key)
+		if _, ok := errors.AsType[protocolError](err); !ok {
+			t.Fatalf("expected protocol error, got %v", err)
+		}
+	}
+}
 
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		FileKey("a_kind_of_long_filename.ext", &benchmarkFileKey.key)
+func TestEncryptedShortResponse(t *testing.T) {
+	var key [keySize]byte
+	m := newTestModel()
+	c := getRawConnection(NewConnection(c0ID, nil, nil, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	e := newEncryptedConnection(c, c, newFolderKeyRegistry(), testKeyGen)
+	e.folderKeys.keys["folder"] = &key
+	go func() {
+		msg := <-c.outbox
+		req := msg.msg.(*bep.Request)
+		fileKey := testKeyGen.FileKey("file", &key)
+		c.handleResponse(&Response{ID: int(req.Id), Data: encryptBytes([]byte("short"), fileKey)})
+	}()
+	_, err := e.Request(context.Background(), &Request{Folder: "folder", Name: "file", Size: 1024})
+	if _, ok := errors.AsType[protocolError](err); !ok {
+		t.Fatalf("expected protocol error, got %v", err)
+	}
+	select {
+	case <-c.Closed():
+	default:
+		t.Fatal("connection was not closed")
 	}
 }

@@ -23,11 +23,11 @@ var (
 	sessionMut      = sync.RWMutex{}
 	activeSessions  = make([]*session, 0)
 	pendingSessions = make(map[string]*session)
-	numProxies      int64
-	bytesProxied    int64
+	numProxies      atomic.Int64
+	bytesProxied    atomic.Int64
 )
 
-func newSession(serverid, clientid syncthingprotocol.DeviceID, sessionRateLimit, globalRateLimit *rate.Limiter) *session {
+func newSession(serverid, clientid syncthingprotocol.DeviceID, sessionLimitBps int, globalRateLimit *rate.Limiter) *session {
 	serverkey := make([]byte, 32)
 	_, err := rand.Read(serverkey)
 	if err != nil {
@@ -40,12 +40,17 @@ func newSession(serverid, clientid syncthingprotocol.DeviceID, sessionRateLimit,
 		return nil
 	}
 
+	var sessionRateLimit *rate.Limiter
+	if sessionLimitBps > 0 {
+		sessionRateLimit = rate.NewLimiter(rate.Limit(sessionLimitBps), 2*sessionLimitBps)
+	}
 	ses := &session{
 		serverkey: serverkey,
 		serverid:  serverid,
 		clientkey: clientkey,
 		clientid:  clientid,
 		rateLimit: makeRateLimitFunc(sessionRateLimit, globalRateLimit),
+		limiter:   sessionRateLimit,
 		connsChan: make(chan net.Conn),
 		conns:     make([]net.Conn, 0, 2),
 	}
@@ -68,7 +73,6 @@ func findSession(key string) *session {
 	ses, ok := pendingSessions[key]
 	if !ok {
 		return nil
-
 	}
 	delete(pendingSessions, key)
 	return ses
@@ -110,6 +114,7 @@ type session struct {
 	clientid  syncthingprotocol.DeviceID
 
 	rateLimit func(bytes int)
+	limiter   *rate.Limiter
 
 	connsChan chan net.Conn
 	conns     []net.Conn
@@ -153,19 +158,12 @@ func (s *session) Serve() {
 			}
 
 			wg := sync.WaitGroup{}
-			wg.Add(2)
 
 			var err0 error
-			go func() {
-				err0 = s.proxy(s.conns[0], s.conns[1])
-				wg.Done()
-			}()
+			wg.Go(func() { err0 = s.proxy(s.conns[0], s.conns[1]) })
 
 			var err1 error
-			go func() {
-				err1 = s.proxy(s.conns[1], s.conns[0])
-				wg.Done()
-			}()
+			wg.Go(func() { err1 = s.proxy(s.conns[1], s.conns[0]) })
 
 			sessionMut.Lock()
 			activeSessions = append(activeSessions, s)
@@ -251,8 +249,8 @@ func (s *session) proxy(c1, c2 net.Conn) error {
 		log.Println("Proxy", c1.RemoteAddr(), "->", c2.RemoteAddr())
 	}
 
-	atomic.AddInt64(&numProxies, 1)
-	defer atomic.AddInt64(&numProxies, -1)
+	numProxies.Add(1)
+	defer numProxies.Add(-1)
 
 	buf := make([]byte, networkBufferSize)
 	for {
@@ -262,7 +260,7 @@ func (s *session) proxy(c1, c2 net.Conn) error {
 			return err
 		}
 
-		atomic.AddInt64(&bytesProxied, int64(n))
+		bytesProxied.Add(int64(n))
 
 		if debug {
 			log.Printf("%d bytes from %s to %s", n, c1.RemoteAddr(), c2.RemoteAddr())
@@ -332,10 +330,7 @@ func take(tokens int, ls ...*rate.Limiter) {
 
 	for tokens > 0 {
 		// chunk is how many tokens we can consume at a time
-		chunk := tokens
-		if chunk > minBurst {
-			chunk = minBurst
-		}
+		chunk := min(tokens, minBurst)
 
 		// maxDelay is the longest delay mandated by any of the limiters for
 		// the chosen chunk size.

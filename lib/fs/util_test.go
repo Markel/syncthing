@@ -7,11 +7,13 @@
 package fs
 
 import (
+	"errors"
 	"math/rand"
-	"runtime"
 	"testing"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/syncthing/syncthing/lib/build"
 )
 
 func TestCommonPrefix(t *testing.T) {
@@ -23,7 +25,7 @@ func TestCommonPrefix(t *testing.T) {
 		}
 	}
 
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		test(`c:\Audrius\Downloads`, `c:\Audrius\Docs`, `c:\Audrius`)
 		test(`c:\Audrius\Downloads`, `C:\Audrius\Docs`, ``) // Case differences :(
 		test(`C:\Audrius-a\Downloads`, `C:\Audrius-b\Docs`, `C:\`)
@@ -68,9 +70,10 @@ func TestWindowsInvalidFilename(t *testing.T) {
 
 	for _, tc := range cases {
 		err := WindowsInvalidFilename(tc.name)
-		if err != tc.err {
+		if !errors.Is(err, tc.err) {
 			t.Errorf("For %q, got %v, expected %v", tc.name, err, tc.err)
 		}
+		t.Logf("%s: %v", tc.name, err)
 	}
 }
 
@@ -103,7 +106,7 @@ func TestSanitizePath(t *testing.T) {
 func TestSanitizePathFuzz(t *testing.T) {
 	buf := make([]byte, 128)
 
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		rand.Read(buf)
 		path := SanitizePath(string(buf))
 		if !utf8.ValidString(path) {
@@ -123,9 +126,11 @@ func benchmarkWindowsInvalidFilename(b *testing.B, name string) {
 		WindowsInvalidFilename(name)
 	}
 }
+
 func BenchmarkWindowsInvalidFilenameValid(b *testing.B) {
 	benchmarkWindowsInvalidFilename(b, "License.txt.gz")
 }
+
 func BenchmarkWindowsInvalidFilenameNUL(b *testing.B) {
 	benchmarkWindowsInvalidFilename(b, "nul.txt.gz")
 }

@@ -12,16 +12,20 @@ import (
 	crand "crypto/rand"
 	"io"
 	"math/rand"
+	"sync/atomic"
 	"testing"
+
+	"golang.org/x/time/rate"
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"golang.org/x/time/rate"
 )
 
-var device1, device2, device3, device4 protocol.DeviceID
-var dev1Conf, dev2Conf, dev3Conf, dev4Conf config.DeviceConfiguration
+var (
+	device1, device2, device3, device4     protocol.DeviceID
+	dev1Conf, dev2Conf, dev3Conf, dev4Conf config.DeviceConfiguration
+)
 
 func init() {
 	device1, _ = protocol.DeviceIDFromString("AIR6LPZ7K4PTTUXQSMUUCPQ5YWOEDFIIQJUG7772YQXXR5YD6AWQ")
@@ -218,7 +222,7 @@ func TestLimitedWriterWrite(t *testing.T) {
 
 	// A buffer with random data that is larger than the write size and not
 	// a precise multiple either.
-	src := make([]byte, int(12.5*maxSingleWriteSize))
+	src := make([]byte, int(12.5*8192))
 	if _, err := crand.Reader.Read(src); err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +238,7 @@ func TestLimitedWriterWrite(t *testing.T) {
 		writer: cw,
 		waiterHolder: waiterHolder{
 			waiter:    rate.NewLimiter(rate.Limit(42), limiterBurstSize),
-			limitsLAN: new(atomicBool),
+			limitsLAN: new(atomic.Bool),
 			isLAN:     false, // enables limiting
 		},
 	}
@@ -242,9 +246,14 @@ func TestLimitedWriterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify there were lots of writes and that the end result is identical.
-	if cw.writeCount != 13 {
-		t.Error("expected lots of smaller writes, but not too many")
+	// Verify there were lots of writes (we expect one kilobyte write size
+	// for the very low rate in this test) and that the end result is
+	// identical.
+	if cw.writeCount < 10*8 {
+		t.Error("expected lots of smaller writes")
+	}
+	if cw.writeCount > 15*8 {
+		t.Error("expected fewer larger writes")
 	}
 	if !bytes.Equal(src, dst.Bytes()) {
 		t.Error("results should be equal")
@@ -258,7 +267,7 @@ func TestLimitedWriterWrite(t *testing.T) {
 		writer: cw,
 		waiterHolder: waiterHolder{
 			waiter:    rate.NewLimiter(rate.Limit(42), limiterBurstSize),
-			limitsLAN: new(atomicBool),
+			limitsLAN: new(atomic.Bool),
 			isLAN:     true, // disables limiting
 		},
 	}
@@ -282,7 +291,7 @@ func TestLimitedWriterWrite(t *testing.T) {
 		writer: cw,
 		waiterHolder: waiterHolder{
 			waiter:    totalWaiter{rate.NewLimiter(rate.Inf, limiterBurstSize), rate.NewLimiter(rate.Inf, limiterBurstSize)},
-			limitsLAN: new(atomicBool),
+			limitsLAN: new(atomic.Bool),
 			isLAN:     false, // enables limiting
 		},
 	}
@@ -310,7 +319,7 @@ func TestLimitedWriterWrite(t *testing.T) {
 				rate.NewLimiter(rate.Limit(42), limiterBurstSize),
 				rate.NewLimiter(rate.Inf, limiterBurstSize),
 			},
-			limitsLAN: new(atomicBool),
+			limitsLAN: new(atomic.Bool),
 			isLAN:     false, // enables limiting
 		},
 	}
@@ -319,8 +328,11 @@ func TestLimitedWriterWrite(t *testing.T) {
 	}
 
 	// Verify there were lots of writes and that the end result is identical.
-	if cw.writeCount != 13 {
-		t.Error("expected just the one write")
+	if cw.writeCount < 10*8 {
+		t.Error("expected lots of smaller writes")
+	}
+	if cw.writeCount > 15*8 {
+		t.Error("expected fewer larger writes")
 	}
 	if !bytes.Equal(src, dst.Bytes()) {
 		t.Error("results should be equal")

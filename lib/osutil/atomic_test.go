@@ -17,7 +17,7 @@ func TestCreateAtomicCreate(t *testing.T) {
 	os.RemoveAll("testdata")
 	defer os.RemoveAll("testdata")
 
-	if err := os.Mkdir("testdata", 0755); err != nil {
+	if err := os.Mkdir("testdata", 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -52,25 +52,22 @@ func TestCreateAtomicCreate(t *testing.T) {
 }
 
 func TestCreateAtomicReplace(t *testing.T) {
-	testCreateAtomicReplace(t, 0666)
+	testCreateAtomicReplace(t, 0o666)
 }
+
 func TestCreateAtomicReplaceReadOnly(t *testing.T) {
-	testCreateAtomicReplace(t, 0444) // windows compatible read-only bits
+	testCreateAtomicReplace(t, 0o444) // windows compatible read-only bits
 }
 
 func testCreateAtomicReplace(t *testing.T, oldPerms os.FileMode) {
 	t.Helper()
 
-	testdir, err := os.MkdirTemp("", "syncthing")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testdir := t.TempDir()
 	testfile := filepath.Join(testdir, "testfile")
 
 	os.RemoveAll(testdir)
-	defer os.RemoveAll(testdir)
 
-	if err := os.Mkdir(testdir, 0755); err != nil {
+	if err := os.Mkdir(testdir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 

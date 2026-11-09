@@ -5,7 +5,6 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //go:build (!solaris && !darwin) || (solaris && cgo) || (darwin && cgo)
-// +build !solaris,!darwin solaris,cgo darwin,cgo
 
 package fs
 
@@ -15,7 +14,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,6 +21,8 @@ import (
 	"time"
 
 	"github.com/syncthing/notify"
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/ignore/ignoreresult"
 )
 
 func TestMain(m *testing.M) {
@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testDirAbs = filepath.Join(dir, testDir)
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		testDirAbs = longFilenameSupport(testDirAbs)
 	}
 
@@ -68,7 +68,7 @@ var (
 )
 
 func TestWatchIgnore(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "ignore"
@@ -92,14 +92,14 @@ func TestWatchIgnore(t *testing.T) {
 }
 
 func TestWatchInclude(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "include"
 
 	file := "file"
 	ignored := "ignored"
-	testFs.MkdirAll(filepath.Join(name, ignored), 0777)
+	testFs.MkdirAll(filepath.Join(name, ignored), 0o777)
 	included := filepath.Join(ignored, "included")
 
 	testCase := func() {
@@ -119,7 +119,7 @@ func TestWatchInclude(t *testing.T) {
 }
 
 func TestWatchRename(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "rename"
@@ -134,7 +134,7 @@ func TestWatchRename(t *testing.T) {
 	destEvent := Event{new, Remove}
 	// Only on these platforms the removed file can be differentiated from
 	// the created file during renaming
-	if runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "solaris" || runtime.GOOS == "freebsd" {
+	if build.IsWindows || build.IsLinux || build.IsSolaris || build.IsIllumos || build.IsFreeBSD {
 		destEvent = Event{new, NonRemove}
 	}
 	expectedEvents := []Event{
@@ -154,7 +154,7 @@ func TestWatchRename(t *testing.T) {
 // out of root event on every event.
 // https://github.com/syncthing/syncthing/issues/5695
 func TestWatchWinRoot(t *testing.T) {
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		t.Skip("Windows specific test")
 	}
 
@@ -288,7 +288,7 @@ func TestWatchSubpath(t *testing.T) {
 
 // TestWatchOverflow checks that an event at the root is sent when maxFiles is reached
 func TestWatchOverflow(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "overflow"
@@ -313,16 +313,16 @@ func TestWatchOverflow(t *testing.T) {
 }
 
 func TestWatchErrorLinuxInterpretation(t *testing.T) {
-	if runtime.GOOS != "linux" {
+	if !build.IsLinux {
 		t.Skip("testing of linux specific error codes")
 	}
 
-	var errTooManyFiles = &os.PathError{
+	errTooManyFiles := &os.PathError{
 		Op:   "error while traversing",
 		Path: "foo",
 		Err:  syscall.Errno(24),
 	}
-	var errNoSpace = &os.PathError{
+	errNoSpace := &os.PathError{
 		Op:   "error while traversing",
 		Path: "bar",
 		Err:  syscall.Errno(28),
@@ -341,18 +341,18 @@ func TestWatchErrorLinuxInterpretation(t *testing.T) {
 }
 
 func TestWatchSymlinkedRoot(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		t.Skip("Involves symlinks")
 	}
 
 	name := "symlinkedRoot"
-	if err := testFs.MkdirAll(name, 0755); err != nil {
+	if err := testFs.MkdirAll(name, 0o755); err != nil {
 		panic(fmt.Sprintf("Failed to create directory %s: %s", name, err))
 	}
 	defer testFs.RemoveAll(name)
 
 	root := filepath.Join(name, "root")
-	if err := testFs.MkdirAll(root, 0777); err != nil {
+	if err := testFs.MkdirAll(root, 0o777); err != nil {
 		panic(err)
 	}
 	link := filepath.Join(name, "link")
@@ -363,13 +363,12 @@ func TestWatchSymlinkedRoot(t *testing.T) {
 
 	linkedFs := NewFilesystem(FilesystemTypeBasic, filepath.Join(testFs.URI(), link))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if _, _, err := linkedFs.Watch(".", fakeMatcher{}, ctx, false); err != nil {
 		panic(err)
 	}
 
-	if err := linkedFs.MkdirAll("foo", 0777); err != nil {
+	if err := linkedFs.MkdirAll("foo", 0o777); err != nil {
 		panic(err)
 	}
 
@@ -385,7 +384,7 @@ func TestUnrootedChecked(t *testing.T) {
 }
 
 func TestWatchIssue4877(t *testing.T) {
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		t.Skip("Windows specific test")
 	}
 
@@ -440,7 +439,7 @@ func TestWatchModTime(t *testing.T) {
 
 	var allowedEvents []Event
 	// Apparently an event for the parent is also sent on mac
-	if runtime.GOOS == "darwin" {
+	if build.IsDarwin {
 		allowedEvents = []Event{
 			{name, NonRemove},
 		}
@@ -507,7 +506,7 @@ func TestTruncateFileOnly(t *testing.T) {
 // path relative to folder root, also creates parent dirs if necessary
 func createTestFile(name string, file string) string {
 	joined := filepath.Join(name, file)
-	if err := testFs.MkdirAll(filepath.Dir(joined), 0755); err != nil {
+	if err := testFs.MkdirAll(filepath.Dir(joined), 0o755); err != nil {
 		panic(fmt.Sprintf("Failed to create parent directory for %s: %s", joined, err))
 	}
 	handle, err := testFs.Create(joined)
@@ -529,7 +528,7 @@ func renameTestFile(name string, old string, new string) {
 func modifyTestFile(name string, file string, content string) {
 	joined := filepath.Join(testDirAbs, name, file)
 
-	err := os.WriteFile(joined, []byte(content), 0755)
+	err := os.WriteFile(joined, []byte(content), 0o755)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to modify test file %s: %s", joined, err))
 	}
@@ -540,7 +539,7 @@ func sleepMs(ms int) {
 }
 
 func testScenario(t *testing.T, name string, testCase func(), expectedEvents, allowedEvents []Event, fm fakeMatcher, ignorePerms bool) {
-	if err := testFs.MkdirAll(name, 0755); err != nil {
+	if err := testFs.MkdirAll(name, 0o755); err != nil {
 		panic(fmt.Sprintf("Failed to create directory %s: %s", name, err))
 	}
 	defer testFs.RemoveAll(name)
@@ -567,7 +566,7 @@ func testScenario(t *testing.T, name string, testCase func(), expectedEvents, al
 }
 
 func testWatchOutput(t *testing.T, name string, in <-chan Event, expectedEvents, allowedEvents []Event, ctx context.Context, cancel context.CancelFunc) {
-	var expected = make(map[Event]struct{})
+	expected := make(map[Event]struct{})
 	for _, ev := range expectedEvents {
 		ev.Name = filepath.Join(name, ev.Name)
 		expected[ev] = struct{}{}
@@ -613,8 +612,11 @@ type fakeMatcher struct {
 	skipIgnoredDirs bool
 }
 
-func (fm fakeMatcher) ShouldIgnore(name string) bool {
-	return name != fm.include && name == fm.ignore
+func (fm fakeMatcher) Match(name string) ignoreresult.R {
+	if name != fm.include && name == fm.ignore {
+		return ignoreresult.Ignored
+	}
+	return ignoreresult.NotIgnored
 }
 
 func (fm fakeMatcher) SkipIgnoredDirs() bool {
@@ -627,10 +629,10 @@ func (e fakeEventInfo) Path() string {
 	return string(e)
 }
 
-func (e fakeEventInfo) Event() notify.Event {
+func (fakeEventInfo) Event() notify.Event {
 	return notify.Write
 }
 
-func (e fakeEventInfo) Sys() interface{} {
+func (fakeEventInfo) Sys() any {
 	return nil
 }

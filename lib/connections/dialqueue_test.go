@@ -20,7 +20,7 @@ func TestDialQueueSort(t *testing.T) {
 	t.Run("ByLastSeen", func(t *testing.T) {
 		t.Parallel()
 
-		// Devices seen within the last week or so should be sorted stricly in order.
+		// Devices seen within the last week or so should be sorted strictly in order.
 		now := time.Now()
 		queue := dialQueue{
 			{id: device1, lastSeen: now.Add(-5 * time.Hour)},  // 1
@@ -54,7 +54,7 @@ func TestDialQueueSort(t *testing.T) {
 
 		var seen1, seen2 int
 
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			queue.Sort()
 			res := shortDevices(queue)
 			if reflect.DeepEqual(res, expected1) {
@@ -90,7 +90,7 @@ func TestDialQueueSort(t *testing.T) {
 
 		var seen1, seen2 int
 
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			queue.Sort()
 			res := shortDevices(queue)
 			if reflect.DeepEqual(res, expected1) {

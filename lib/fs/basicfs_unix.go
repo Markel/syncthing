@@ -5,19 +5,18 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build !windows
-// +build !windows
 
 package fs
 
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
-func (BasicFilesystem) SymlinksSupported() bool {
-	return true
-}
+const optNoFollow = syscall.O_NOFOLLOW
 
 func (f *BasicFilesystem) CreateSymlink(target, name string) error {
 	name, err := f.rooted(name)
@@ -35,10 +34,6 @@ func (f *BasicFilesystem) ReadSymlink(name string) (string, error) {
 	return os.Readlink(name)
 }
 
-func (f *BasicFilesystem) mkdirAll(path string, perm os.FileMode) error {
-	return os.MkdirAll(path, perm)
-}
-
 // Unhide is a noop on unix, as unhiding files requires renaming them.
 // We still check that the relative path does not try to escape the root
 func (f *BasicFilesystem) Unhide(name string) error {
@@ -53,15 +48,39 @@ func (f *BasicFilesystem) Hide(name string) error {
 	return err
 }
 
-func (f *BasicFilesystem) Roots() ([]string, error) {
+func (*BasicFilesystem) Roots() ([]string, error) {
 	return []string{"/"}, nil
+}
+
+func (f *BasicFilesystem) Lchown(name, uid, gid string) error {
+	name, err := f.rooted(name)
+	if err != nil {
+		return err
+	}
+	nuid, err := strconv.Atoi(uid)
+	if err != nil {
+		return err
+	}
+	ngid, err := strconv.Atoi(gid)
+	if err != nil {
+		return err
+	}
+	return os.Lchown(name, nuid, ngid)
+}
+
+func (f *BasicFilesystem) Remove(name string) error {
+	name, err := f.rooted(name)
+	if err != nil {
+		return err
+	}
+	return os.Remove(name)
 }
 
 // unrootedChecked returns the path relative to the folder root (same as
 // unrooted) or an error if the given path is not a subpath and handles the
 // special case when the given path is the folder root without a trailing
 // pathseparator.
-func (f *BasicFilesystem) unrootedChecked(absPath string, roots []string) (string, *ErrWatchEventOutsideRoot) {
+func (f *BasicFilesystem) unrootedChecked(absPath string, roots []string) (string, *WatchEventOutsideRootError) {
 	for _, root := range roots {
 		// Make sure the root ends with precisely one path separator, to
 		// ease prefix comparisons.

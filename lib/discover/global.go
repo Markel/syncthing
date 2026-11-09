@@ -14,18 +14,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
-	stdsync "sync"
+	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 type globalClient struct {
+	errorHolder
+
 	server         string
 	addrList       AddressLister
 	announceClient httpClient
@@ -33,7 +43,10 @@ type globalClient struct {
 	noAnnounce     bool
 	noLookup       bool
 	evLogger       events.Logger
-	errorHolder
+
+	lastAnnouncement []byte
+	reannounceAt     time.Time
+	retryAt          time.Time
 }
 
 type httpClient interface {
@@ -44,12 +57,22 @@ type httpClient interface {
 const (
 	defaultReannounceInterval             = 30 * time.Minute
 	announceErrorRetryInterval            = 5 * time.Minute
-	requestTimeout                        = 5 * time.Second
+	requestTimeout                        = 30 * time.Second
 	maxAddressChangesBetweenAnnouncements = 10
 )
 
 type announcement struct {
 	Addresses []string `json:"addresses"`
+}
+
+func (a announcement) MarshalJSON() ([]byte, error) {
+	type announcementCopy announcement
+
+	a.Addresses = sanitizeRelayAddresses(a.Addresses)
+	slices.Sort(a.Addresses)
+
+	aCopy := announcementCopy(a)
+	return json.Marshal(aCopy)
 }
 
 type serverOptions struct {
@@ -71,7 +94,7 @@ func (e *lookupError) CacheFor() time.Duration {
 	return e.cacheFor
 }
 
-func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLogger events.Logger) (FinderService, error) {
+func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLogger events.Logger, registry *registry.Registry) (FinderService, error) {
 	server, opts, err := parseOptions(server)
 	if err != nil {
 		return nil, err
@@ -88,16 +111,25 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLo
 	// The http.Client used for announcements. It needs to have our
 	// certificate to prove our identity, and may or may not verify the server
 	// certificate depending on the insecure setting.
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if registry != nil {
+		dialContext = dialer.DialContextReusePortFunc(registry)
+	} else {
+		dialContext = dialer.DialContext
+	}
 	var announceClient httpClient = &contextClient{&http.Client{
 		Timeout: requestTimeout,
-		Transport: &http.Transport{
-			DialContext: dialer.DialContextReusePort,
-			Proxy:       http.ProxyFromEnvironment,
+		Transport: http2EnabledTransport(&http.Transport{
+			DialContext:       dialContext,
+			Proxy:             http.ProxyFromEnvironment,
+			DisableKeepAlives: true, // announcements are few and far between, so don't keep the connection open
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: opts.insecure,
 				Certificates:       []tls.Certificate{cert},
+				MinVersion:         tls.VersionTLS12,
+				ClientSessionCache: tls.NewLRUClientSessionCache(0),
 			},
-		},
+		}),
 	}}
 	if opts.id != "" {
 		announceClient = newIDCheckingHTTPClient(announceClient, devID)
@@ -107,13 +139,16 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLo
 	// certificate here, so lets not include it. May be insecure if requested.
 	var queryClient httpClient = &contextClient{&http.Client{
 		Timeout: requestTimeout,
-		Transport: &http.Transport{
-			DialContext: dialer.DialContext,
-			Proxy:       http.ProxyFromEnvironment,
+		Transport: http2EnabledTransport(&http.Transport{
+			DialContext:     dialer.DialContext,
+			Proxy:           http.ProxyFromEnvironment,
+			IdleConnTimeout: time.Second,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: opts.insecure,
+				MinVersion:         tls.VersionTLS12,
+				ClientSessionCache: tls.NewLRUClientSessionCache(0),
 			},
-		},
+		}),
 	}}
 	if opts.id != "" {
 		queryClient = newIDCheckingHTTPClient(queryClient, devID)
@@ -129,7 +164,7 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLo
 		evLogger:       evLogger,
 	}
 	if !opts.noAnnounce {
-		// If we are supposed to annonce, it's an error until we've done so.
+		// If we are supposed to announce, it's an error until we've done so.
 		cl.setError(errors.New("not announced"))
 	}
 
@@ -156,12 +191,12 @@ func (c *globalClient) Lookup(ctx context.Context, device protocol.DeviceID) (ad
 
 	resp, err := c.queryClient.Get(ctx, qURL.String())
 	if err != nil {
-		l.Debugln("globalClient.Lookup", qURL, err)
+		slog.DebugContext(ctx, "globalClient.Lookup", "url", qURL, slogutil.Error(err))
 		return nil, err
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		l.Debugln("globalClient.Lookup", qURL, resp.Status)
+		slog.DebugContext(ctx, "globalClient.Lookup", "url", qURL, "status", resp.Status)
 		err := errors.New(resp.Status)
 		if secs, atoiErr := strconv.Atoi(resp.Header.Get("Retry-After")); atoiErr == nil && secs > 0 {
 			err = &lookupError{
@@ -213,7 +248,7 @@ func (c *globalClient) Serve(ctx context.Context) error {
 			} else if timerResetCount == maxAddressChangesBetweenAnnouncements {
 				// Yet only do it if we haven't had to reset maxAddressChangesBetweenAnnouncements times in a row,
 				// so if something is flip-flopping within 2 seconds, we don't end up in a permanent reset loop.
-				l.Warnf("Detected a flip-flopping listener")
+				slog.ErrorContext(ctx, "Detected a flip-flopping listener", slog.String("server", c.server))
 				c.setError(errors.New("flip flopping listener"))
 				// Incrementing the count above 10 will prevent us from warning or setting the error again
 				// It will also suppress event based resets until we've had a proper round after announceErrorRetryInterval
@@ -231,6 +266,14 @@ func (c *globalClient) Serve(ctx context.Context) error {
 }
 
 func (c *globalClient) sendAnnouncement(ctx context.Context, timer *time.Timer) {
+	// Retry-After is unconditional, we've been told to go away and should
+	// stay away until such time passes, even if addresses change for
+	// example.
+	if time.Now().Before(c.retryAt) {
+		timer.Reset(time.Until(c.retryAt))
+		return
+	}
+
 	var ann announcement
 	if c.addrList != nil {
 		ann.Addresses = c.addrList.ExternalAddresses()
@@ -248,28 +291,37 @@ func (c *globalClient) sendAnnouncement(ctx context.Context, timer *time.Timer) 
 	// The marshal doesn't fail, I promise.
 	postData, _ := json.Marshal(ann)
 
-	l.Debugf("%s Announcement: %v", c, ann)
+	if bytes.Equal(postData, c.lastAnnouncement) && time.Now().Before(c.reannounceAt) {
+		timer.Reset(time.Until(c.reannounceAt))
+		return
+	}
+
+	slog.DebugContext(ctx, "send announcement", "server", c.server, "announcement", ann)
+	// If we fail the announcement we need to retry even if the data hasn't
+	// changed, so clear the previous data.
+	c.lastAnnouncement = nil
 
 	resp, err := c.announceClient.Post(ctx, c.server, "application/json", bytes.NewReader(postData))
 	if err != nil {
-		l.Debugln(c, "announce POST:", err)
+		slog.DebugContext(ctx, "announce POST", "server", c.server, slogutil.Error(err))
 		c.setError(err)
 		timer.Reset(announceErrorRetryInterval)
 		return
 	}
-	l.Debugln(c, "announce POST:", resp.Status)
+	slog.DebugContext(ctx, "announce POST", "server", c.server, "status", resp.Status)
 	resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		l.Debugln(c, "announce POST:", resp.Status)
 		c.setError(errors.New(resp.Status))
 
 		if h := resp.Header.Get("Retry-After"); h != "" {
 			// The server has a recommendation on when we should
 			// retry. Follow it.
 			if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
-				l.Debugln(c, "announce Retry-After:", secs, err)
-				timer.Reset(time.Duration(secs) * time.Second)
+				slog.DebugContext(ctx, "server sets retry-after", "server", c.server, "seconds", secs)
+				retryInterval := time.Duration(secs) * time.Second
+				c.retryAt = time.Now().Add(retryInterval)
+				timer.Reset(retryInterval)
 				return
 			}
 		}
@@ -279,21 +331,23 @@ func (c *globalClient) sendAnnouncement(ctx context.Context, timer *time.Timer) 
 	}
 
 	c.setError(nil)
+	c.lastAnnouncement = postData
+	reannounceInterval := defaultReannounceInterval
 
 	if h := resp.Header.Get("Reannounce-After"); h != "" {
 		// The server has a recommendation on when we should
 		// reannounce. Follow it.
 		if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
-			l.Debugln(c, "announce Reannounce-After:", secs, err)
-			timer.Reset(time.Duration(secs) * time.Second)
-			return
+			slog.DebugContext(ctx, "announce sets reannounce-after", "server", c.server, "seconds", secs)
+			reannounceInterval = time.Duration(secs) * time.Second
 		}
 	}
 
-	timer.Reset(defaultReannounceInterval)
+	c.reannounceAt = time.Now().Add(reannounceInterval)
+	timer.Reset(reannounceInterval)
 }
 
-func (c *globalClient) Cache() map[protocol.DeviceID]CacheEntry {
+func (*globalClient) Cache() map[protocol.DeviceID]CacheEntry {
 	// The globalClient doesn't do caching
 	return nil
 }
@@ -346,6 +400,7 @@ func queryBool(q url.Values, key string) bool {
 
 type idCheckingHTTPClient struct {
 	httpClient
+
 	id protocol.DeviceID
 }
 
@@ -379,6 +434,7 @@ func (c *idCheckingHTTPClient) Get(ctx context.Context, url string) (*http.Respo
 		return nil, err
 	}
 	if err := c.check(resp); err != nil {
+		resp.Body.Close()
 		return nil, err
 	}
 
@@ -391,6 +447,7 @@ func (c *idCheckingHTTPClient) Post(ctx context.Context, url, ctype string, data
 		return nil, err
 	}
 	if err := c.check(resp); err != nil {
+		resp.Body.Close()
 		return nil, err
 	}
 
@@ -399,7 +456,7 @@ func (c *idCheckingHTTPClient) Post(ctx context.Context, url, ctype string, data
 
 type errorHolder struct {
 	err error
-	mut stdsync.Mutex // uses stdlib sync as I want this to be trivially embeddable, and there is no risk of blocking
+	mut sync.Mutex // uses stdlib sync as I want this to be trivially embeddable, and there is no risk of blocking
 }
 
 func (e *errorHolder) setError(err error) {
@@ -420,27 +477,21 @@ type contextClient struct {
 }
 
 func (c *contextClient) Get(ctx context.Context, url string) (*http.Response, error) {
-	// For <go1.13 compatibility. Use the following commented line once that
-	// isn't required anymore.
-	// req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Cancel = ctx.Done()
+	req.Header.Set("User-Agent", build.UserAgent())
 	return c.Client.Do(req)
 }
 
 func (c *contextClient) Post(ctx context.Context, url, ctype string, data io.Reader) (*http.Response, error) {
-	// For <go1.13 compatibility. Use the following commented line once that
-	// isn't required anymore.
-	// req, err := http.NewRequestWithContext(ctx, "POST", url, data)
-	req, err := http.NewRequest("POST", url, data)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, data)
 	if err != nil {
 		return nil, err
 	}
-	req.Cancel = ctx.Done()
 	req.Header.Set("Content-Type", ctype)
+	req.Header.Set("User-Agent", build.UserAgent())
 	return c.Client.Do(req)
 }
 
@@ -453,5 +504,10 @@ func ipv4Identity(port int) string {
 }
 
 func ipv6Identity(addr string) string {
-	return fmt.Sprintf("IPv6 local multicast discovery on address %s", addr)
+	return "IPv6 local multicast discovery on address " + addr
+}
+
+func http2EnabledTransport(t *http.Transport) *http.Transport {
+	_ = http2.ConfigureTransport(t)
+	return t
 }

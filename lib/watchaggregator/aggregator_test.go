@@ -10,11 +10,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
@@ -42,7 +42,7 @@ const (
 var (
 	folderRoot       = filepath.Clean("/home/someuser/syncthing")
 	defaultFolderCfg = config.FolderConfiguration{
-		FilesystemType:  fs.FilesystemTypeBasic,
+		FilesystemType:  config.FilesystemTypeBasic,
 		Path:            folderRoot,
 		FSWatcherDelayS: testNotifyDelayS,
 	}
@@ -66,8 +66,7 @@ func TestAggregate(t *testing.T) {
 
 	folderCfg := defaultFolderCfg.Copy()
 	folderCfg.ID = "Aggregate"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	a := newAggregator(ctx, folderCfg)
 
 	// checks whether maxFilesPerDir events in one dir are kept as is
@@ -140,7 +139,7 @@ func TestAggregate(t *testing.T) {
 		dirs[i] = "dir" + strconv.Itoa(i)
 	}
 	for _, dir := range dirs {
-		for i := 0; i < filesPerDir; i++ {
+		for i := range filesPerDir {
 			a.newEvent(fs.Event{
 				Name: filepath.Join(dir, strconv.Itoa(i)),
 				Type: fs.NonRemove,
@@ -163,7 +162,7 @@ func TestInProgress(t *testing.T) {
 		sleepMs(100)
 		c <- fs.Event{Name: "inprogress", Type: fs.NonRemove}
 		sleepMs(1000)
-		evLogger.Log(events.ItemFinished, map[string]interface{}{
+		evLogger.Log(events.ItemFinished, map[string]any{
 			"item": "inprogress",
 		})
 		sleepMs(100)
@@ -197,7 +196,7 @@ func TestDelay(t *testing.T) {
 		c <- fs.Event{Name: both, Type: fs.NonRemove}
 		c <- fs.Event{Name: both, Type: fs.Remove}
 		c <- fs.Event{Name: del, Type: fs.Remove}
-		for i := 0; i < 9; i++ {
+		for range 9 {
 			<-timer.C
 			timer.Reset(delay)
 			c <- fs.Event{Name: delayed, Type: fs.NonRemove}
@@ -329,7 +328,7 @@ func testAggregatorOutput(t *testing.T, fsWatchChan <-chan []string, expectedBat
 			continue
 		}
 
-		if runtime.GOOS != "darwin" {
+		if !build.IsDarwin {
 			now := time.Since(startTime)
 			if innerIndex == 0 {
 				switch {

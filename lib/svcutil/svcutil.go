@@ -10,11 +10,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/logger"
-	"github.com/syncthing/syncthing/lib/sync"
-
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/thejerf/suture/v4"
 )
 
@@ -51,7 +51,7 @@ func (e *FatalErr) Unwrap() error {
 	return e.Err
 }
 
-func (e *FatalErr) Is(target error) bool {
+func (*FatalErr) Is(target error) bool {
 	return target == suture.ErrTerminateSupervisorTree
 }
 
@@ -76,7 +76,7 @@ func (e *noRestartErr) Unwrap() error {
 	return e.err
 }
 
-func (e *noRestartErr) Is(target error) bool {
+func (*noRestartErr) Is(target error) bool {
 	return target == suture.ErrDoNotRestart
 }
 
@@ -88,6 +88,7 @@ const (
 	ExitNoUpgradeAvailable ExitStatus = 2
 	ExitRestart            ExitStatus = 3
 	ExitUpgrade            ExitStatus = 4
+	ExitNoRestart          ExitStatus = 5 // do not get restarted by monitor
 )
 
 func (s ExitStatus) AsInt() int {
@@ -106,7 +107,6 @@ func AsService(fn func(ctx context.Context) error, creator string) ServiceWithEr
 	return &service{
 		creator: creator,
 		serve:   fn,
-		mut:     sync.NewMutex(),
 	}
 }
 
@@ -122,7 +122,12 @@ func (s *service) Serve(ctx context.Context) error {
 	s.err = nil
 	s.mut.Unlock()
 
-	err := s.serve(ctx)
+	// The error returned by serve() may well be a network timeout, which as
+	// of Go 1.19 is a context.DeadlineExceeded, which Suture interprets as
+	// a signal to stop the service instead of restarting it. This typically
+	// isn't what we want, so we make sure to remove the context specific
+	// error types unless *our* context is actually cancelled.
+	err := asNonContextError(ctx, s.serve(ctx))
 
 	s.mut.Lock()
 	s.err = err
@@ -139,7 +144,6 @@ func (s *service) Error() error {
 
 func (s *service) String() string {
 	return fmt.Sprintf("Service@%p created by %v", s, s.creator)
-
 }
 
 type doneService func()
@@ -155,12 +159,12 @@ func OnSupervisorDone(sup *suture.Supervisor, fn func()) {
 	sup.Add(doneService(fn))
 }
 
-func SpecWithDebugLogger(l logger.Logger) suture.Spec {
-	return spec(func(e suture.Event) { l.Debugln(e) })
+func SpecWithDebugLogger() suture.Spec {
+	return spec(func(e suture.Event) { slog.Debug(e.String()) })
 }
 
-func SpecWithInfoLogger(l logger.Logger) suture.Spec {
-	return spec(infoEventHook(l))
+func SpecWithInfoLogger() suture.Spec {
+	return spec(infoEventHook())
 }
 
 func spec(eventHook suture.EventHook) suture.Spec {
@@ -175,31 +179,63 @@ func spec(eventHook suture.EventHook) suture.Spec {
 // infoEventHook prints service failures and failures to stop services at level
 // info. All other events and identical, consecutive failures are logged at
 // debug only.
-func infoEventHook(l logger.Logger) suture.EventHook {
+func infoEventHook() suture.EventHook {
 	var prevTerminate suture.EventServiceTerminate
 	return func(ei suture.Event) {
+		m := ei.Map()
+		l := slog.Default().With("supervisor", m["supervisor_name"], "service", m["service_name"])
 		switch e := ei.(type) {
 		case suture.EventStopTimeout:
-			l.Infof("%s: Service %s failed to terminate in a timely manner", e.SupervisorName, e.ServiceName)
+			l.Warn("Service failed to terminate in a timely manner")
 		case suture.EventServicePanic:
-			l.Warnln("Caught a service panic, which shouldn't happen")
-			l.Infoln(e)
+			l.Error("Caught a service panic, which shouldn't happen")
+			l.Warn(e.String()) //nolint:sloglint
 		case suture.EventServiceTerminate:
-			msg := fmt.Sprintf("%s: service %s failed: %s", e.SupervisorName, e.ServiceName, e.Err)
 			if e.ServiceName == prevTerminate.ServiceName && e.Err == prevTerminate.Err {
-				l.Debugln(msg)
+				l.Debug("Service failed repeatedly", slogutil.Error(e.Err))
 			} else {
-				l.Infoln(msg)
+				l.Warn("Service failed", slogutil.Error(e.Err))
 			}
 			prevTerminate = e
-			l.Debugln(e) // Contains some backoff statistics
+			l.Debug(e.String()) // Contains some backoff statistics
 		case suture.EventBackoff:
-			l.Debugf("%s: exiting the backoff state.", e.SupervisorName)
+			l.Debug("Exiting the backoff state")
 		case suture.EventResume:
-			l.Debugf("%s: too many service failures - entering the backoff state.", e.SupervisorName)
+			l.Debug("Too many service failures - entering the backoff state")
 		default:
-			l.Warnln("Unknown suture supervisor event type", e.Type())
-			l.Infoln(e)
+			l.Warn("Unknown suture supervisor event", slog.Any("type", e.Type()))
+			l.Warn(e.String()) //nolint:sloglint
 		}
+	}
+}
+
+// asNonContextError returns err, except if it is context.Canceled or
+// context.DeadlineExceeded in which case the error will be a simple string
+// representation instead. The given context is checked for cancellation,
+// and if it is cancelled then that error is returned instead of err.
+func asNonContextError(ctx context.Context, err error) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s (non-context)", err.Error())
+	}
+	return err
+}
+
+func CallWithContext(ctx context.Context, fn func() error) error {
+	var err error
+	done := make(chan struct{})
+	go func() {
+		err = fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

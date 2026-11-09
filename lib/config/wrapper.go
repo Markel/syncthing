@@ -4,24 +4,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
-//go:generate counterfeiter -o mocks/mocked_wrapper.go --fake-name Wrapper . Wrapper
+//go:generate go tool counterfeiter -o mocks/mocked_wrapper.go --fake-name Wrapper . Wrapper
 
 package config
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/thejerf/suture/v4"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/thejerf/suture/v4"
+	"github.com/syncthing/syncthing/lib/sliceutil"
 )
 
 const (
@@ -100,6 +103,7 @@ type Wrapper interface {
 	GUI() GUIConfiguration
 	LDAP() LDAPConfiguration
 	Options() OptionsConfiguration
+	DefaultIgnores() Ignores
 
 	Folder(id string) (FolderConfiguration, bool)
 	Folders() map[string]FolderConfiguration
@@ -133,7 +137,7 @@ type wrapper struct {
 	subs   []Committer
 	mut    sync.Mutex
 
-	requiresRestart uint32 // an atomic bool
+	requiresRestart atomic.Bool
 }
 
 // Wrap wraps an existing Configuration structure and ties it to a file on
@@ -148,7 +152,6 @@ func Wrap(path string, cfg Configuration, myID protocol.DeviceID, evLogger event
 		myID:     myID,
 		queue:    make(chan modifyEntry, maxModifications),
 		waiter:   noopWaiter{}, // Noop until first config change
-		mut:      sync.NewMutex(),
 	}
 	return w
 }
@@ -197,9 +200,7 @@ func (w *wrapper) Unsubscribe(c Committer) {
 	w.mut.Lock()
 	for i := range w.subs {
 		if w.subs[i] == c {
-			copy(w.subs[i:], w.subs[i+1:])
-			w.subs[len(w.subs)-1] = nil
-			w.subs = w.subs[:len(w.subs)-1]
+			w.subs = sliceutil.RemoveAndZero(w.subs, i)
 			break
 		}
 	}
@@ -292,8 +293,11 @@ func (w *wrapper) Serve(ctx context.Context) error {
 }
 
 func (w *wrapper) serveSave() {
+	if w.path == "" {
+		return
+	}
 	if err := w.Save(); err != nil {
-		l.Warnln("Failed to save config:", err)
+		slog.Error("Failed to save config", slogutil.Error(err))
 	}
 }
 
@@ -324,13 +328,11 @@ func (w *wrapper) replaceLocked(to Configuration) (Waiter, error) {
 }
 
 func (w *wrapper) notifyListeners(from, to Configuration) Waiter {
-	wg := sync.NewWaitGroup()
-	wg.Add(len(w.subs))
+	wg := new(sync.WaitGroup)
 	for _, sub := range w.subs {
-		go func(commiter Committer) {
-			w.notifyListener(commiter, from, to)
-			wg.Done()
-		}(sub)
+		wg.Go(func() {
+			w.notifyListener(sub, from, to)
+		})
 	}
 	return wg
 }
@@ -339,7 +341,7 @@ func (w *wrapper) notifyListener(sub Committer, from, to Configuration) {
 	l.Debugln(sub, "committing configuration")
 	if !sub.CommitConfiguration(from, to) {
 		l.Debugln(sub, "requires restart")
-		w.setRequiresRestart()
+		w.requiresRestart.Store(true)
 	}
 }
 
@@ -437,6 +439,13 @@ func (w *wrapper) GUI() GUIConfiguration {
 	return w.cfg.GUI.Copy()
 }
 
+// DefaultIgnores returns the list of ignore patterns to be used by default on folders.
+func (w *wrapper) DefaultIgnores() Ignores {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	return w.cfg.Defaults.Ignores.Copy()
+}
+
 // IgnoredDevice returns whether or not connection attempts from the given
 // device should be silently ignored.
 func (w *wrapper) IgnoredDevice(id protocol.DeviceID) bool {
@@ -517,13 +526,7 @@ func (w *wrapper) Save() error {
 	return nil
 }
 
-func (w *wrapper) RequiresRestart() bool {
-	return atomic.LoadUint32(&w.requiresRestart) != 0
-}
-
-func (w *wrapper) setRequiresRestart() {
-	atomic.StoreUint32(&w.requiresRestart, 1)
-}
+func (w *wrapper) RequiresRestart() bool { return w.requiresRestart.Load() }
 
 type modifyEntry struct {
 	modifyFunc ModifyFunction

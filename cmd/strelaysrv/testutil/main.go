@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"log"
 	"net"
@@ -127,16 +128,13 @@ func stdinReader(c chan<- string) {
 }
 
 func connectToStdio(stdin <-chan string, conn net.Conn) {
-	go func() {
-
-	}()
-
 	buf := make([]byte, 1024)
 	for {
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond))
 		n, err := conn.Read(buf[0:])
 		if err != nil {
-			nerr, ok := err.(net.Error)
+			var nerr net.Error
+			ok := errors.As(err, &nerr)
 			if !ok || !nerr.Timeout() {
 				log.Println(err)
 				return

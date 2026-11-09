@@ -16,10 +16,18 @@ angular.module('syncthing.core')
             },
             link: function (scope, element, attrs) {
 
+                $(element).on('click', function (event) {
+                    const closestTabAnchor = event.target.closest('a[data-toggle="tab"]');
+
+                    if (closestTabAnchor && closestTabAnchor.href.includes('#')) {
+                        event.preventDefault();
+                    }
+                });
+
                 // before modal show animation
                 $(element).on('show.bs.modal', function () {
 
-                    // cycle through open modals, acertain modal with highest z-index
+                    // cycle through open modals, ascertain modal with highest z-index
                     var largestZ = 1040;
                     $('.modal:visible').each(function (i) {
                         var thisZ = parseInt($(this).css('zIndex'));
@@ -70,7 +78,7 @@ angular.module('syncthing.core')
 
                 });
 
-                // inform syncthingContoller that a modal is ready
+                // inform syncthingController that a modal is ready
                 scope.$parent.modalLoaded();
             }
         };

@@ -10,9 +10,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"unicode"
+
+	"github.com/syncthing/syncthing/lib/build"
 )
 
 const pathSeparatorString = string(PathSeparator)
@@ -35,7 +36,7 @@ func ExpandTilde(path string) (string, error) {
 }
 
 func getHomeDir() (string, error) {
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		// Legacy -- we prioritize this for historical reasons, whereas
 		// os.UserHomeDir uses %USERPROFILE% always.
 		home := filepath.Join(os.Getenv("HomeDrive"), os.Getenv("HomePath"))
@@ -52,10 +53,18 @@ const windowsDisallowedCharacters = (`<>:"|?*` +
 	"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f")
 
 func WindowsInvalidFilename(name string) error {
+	// The path must not contain any disallowed characters.
+	if idx := strings.IndexAny(name, windowsDisallowedCharacters); idx != -1 {
+		return fmt.Errorf("%w: %q", errInvalidFilenameWindowsReservedChar, name[idx:idx+1])
+	}
+
 	// None of the path components should end in space or period, or be a
 	// reserved name.
-	for _, part := range strings.Split(name, `\`) {
-		if len(part) == 0 {
+	for len(name) > 0 {
+		part, rest, _ := strings.Cut(name, `\`)
+		name = rest
+
+		if part == "" {
 			continue
 		}
 		switch part[len(part)-1] {
@@ -63,14 +72,9 @@ func WindowsInvalidFilename(name string) error {
 			// Names ending in space or period are not valid.
 			return errInvalidFilenameWindowsSpacePeriod
 		}
-		if windowsIsReserved(part) {
-			return errInvalidFilenameWindowsReservedName
+		if reserved := windowsReservedNamePart(part); reserved != "" {
+			return fmt.Errorf("%w: %q", errInvalidFilenameWindowsReservedName, reserved)
 		}
-	}
-
-	// The path must not contain any disallowed characters
-	if strings.ContainsAny(name, windowsDisallowedCharacters) {
-		return errInvalidFilenameWindowsReservedChar
 	}
 
 	return nil
@@ -113,13 +117,13 @@ func SanitizePath(path string) string {
 	}
 
 	path = strings.TrimSpace(b.String())
-	if windowsIsReserved(path) {
+	if reserved := windowsReservedNamePart(path); reserved != "" {
 		path = "-" + path
 	}
 	return path
 }
 
-func windowsIsReserved(part string) bool {
+func windowsReservedNamePart(part string) string {
 	// nul.txt.jpg is also disallowed.
 	dot := strings.IndexByte(part, '.')
 	if dot != -1 {
@@ -128,7 +132,7 @@ func windowsIsReserved(part string) bool {
 
 	// Check length to skip allocating ToUpper.
 	if len(part) != 3 && len(part) != 4 {
-		return false
+		return ""
 	}
 
 	// COM0 and LPT0 are missing from the Microsoft docs,
@@ -140,9 +144,9 @@ func windowsIsReserved(part string) bool {
 		"COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT0", "LPT1", "LPT2", "LPT3", "LPT4",
 		"LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
-		return true
+		return part
 	}
-	return false
+	return ""
 }
 
 // IsParent compares paths purely lexicographically, meaning it returns false
@@ -165,10 +169,16 @@ func IsParent(path, parent string) bool {
 		// not be caught below.
 		return path != "/"
 	}
-	if parent[len(parent)-1] != PathSeparator {
-		parent += pathSeparatorString
+	if parent[len(parent)-1] == PathSeparator {
+		return strings.HasPrefix(path, parent)
 	}
-	return strings.HasPrefix(path, parent)
+	if !strings.HasPrefix(path, parent) {
+		return false
+	}
+	if len(path) <= len(parent) {
+		return false
+	}
+	return path[len(parent)] == PathSeparator
 }
 
 func CommonPrefix(first, second string) string {
@@ -182,13 +192,10 @@ func CommonPrefix(first, second string) string {
 
 	isAbs := filepath.IsAbs(first) && filepath.IsAbs(second)
 
-	count := len(firstParts)
-	if len(secondParts) < len(firstParts) {
-		count = len(secondParts)
-	}
+	count := min(len(secondParts), len(firstParts))
 
 	common := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if firstParts[i] != secondParts[i] {
 			break
 		}
@@ -196,7 +203,7 @@ func CommonPrefix(first, second string) string {
 	}
 
 	if isAbs {
-		if runtime.GOOS == "windows" && isVolumeNameOnly(common) {
+		if build.IsWindows && isVolumeNameOnly(common) {
 			// Because strings.Split strips out path separators, if we're at the volume name, we end up without a separator
 			// Wedge an empty element to be joined with.
 			common = append(common, "")

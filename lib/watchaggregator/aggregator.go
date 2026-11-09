@@ -399,7 +399,7 @@ func (a *aggregator) popOldEventsTo(to map[string]*aggregatedEvent, dir *eventDi
 
 func (a *aggregator) isOld(ev *aggregatedEvent, currTime time.Time, delayRem bool) bool {
 	// Deletes should in general be scanned last, therefore they are delayed by
-	// letting them time out. This behaviour is overriden by delayRem == false.
+	// letting them time out. This behaviour is overridden by delayRem == false.
 	// Refer to following comments as to why.
 	// An event that has not registered any new modifications recently is scanned.
 	// a.notifyDelay is the user facing value signifying the normal delay between
@@ -413,7 +413,7 @@ func (a *aggregator) isOld(ev *aggregatedEvent, currTime time.Time, delayRem boo
 	// is delayed to reduce resource usage, but after a certain time (notifyTimeout)
 	// passed it is scanned anyway.
 	// If only removals are remaining to be scanned, there is no point to delay
-	// removals further, so this behaviour is overriden by delayRem == false.
+	// removals further, so this behaviour is overridden by delayRem == false.
 	return currTime.Sub(ev.firstModTime) > a.notifyTimeout
 }
 
@@ -421,7 +421,7 @@ func (a *aggregator) String() string {
 	return fmt.Sprintf("aggregator/%s:", a.folderCfg.Description())
 }
 
-func (a *aggregator) CommitConfiguration(from, to config.Configuration) bool {
+func (a *aggregator) CommitConfiguration(_, to config.Configuration) bool {
 	for _, folderCfg := range to.Folders {
 		if folderCfg.ID == a.folderID {
 			select {
@@ -436,17 +436,25 @@ func (a *aggregator) CommitConfiguration(from, to config.Configuration) bool {
 }
 
 func (a *aggregator) updateConfig(folderCfg config.FolderConfiguration) {
-	a.notifyDelay = time.Duration(folderCfg.FSWatcherDelayS) * time.Second
-	a.notifyTimeout = notifyTimeout(folderCfg.FSWatcherDelayS)
+	a.notifyDelay = time.Duration(folderCfg.FSWatcherDelayS * float64(time.Second))
+	if maxDelay := folderCfg.FSWatcherTimeoutS; maxDelay > 0 {
+		// FSWatcherTimeoutS is set explicitly so use that, but it also
+		// can't be lower than FSWatcherDelayS
+		a.notifyTimeout = time.Duration(max(maxDelay, folderCfg.FSWatcherDelayS) * float64(time.Second))
+	} else {
+		// Use the default FSWatcherTimeoutS calculation
+		a.notifyTimeout = notifyTimeout(folderCfg.FSWatcherDelayS)
+	}
 	a.folderCfg = folderCfg
 }
 
 func updateInProgressSet(event events.Event, inProgress map[string]struct{}) {
-	if event.Type == events.ItemStarted {
+	switch event.Type {
+	case events.ItemStarted:
 		path := event.Data.(map[string]string)["item"]
 		inProgress[path] = struct{}{}
-	} else if event.Type == events.ItemFinished {
-		path := event.Data.(map[string]interface{})["item"].(string)
+	case events.ItemFinished:
+		path := event.Data.(map[string]any)["item"].(string)
 		delete(inProgress, path)
 	}
 }
@@ -456,16 +464,18 @@ func updateInProgressSet(event events.Event, inProgress map[string]struct{}) {
 // air, they were just considered as a sensible compromise between fast updates and
 // saving resources. For short delays the timeout is 6 times the delay, capped at 1
 // minute. For delays longer than 1 minute, the delay and timeout are equal.
-func notifyTimeout(eventDelayS int) time.Duration {
-	shortDelayS := 10
-	shortDelayMultiplicator := 6
-	longDelayS := 60
-	longDelayTimeout := time.Duration(1) * time.Minute
+func notifyTimeout(eventDelayS float64) time.Duration {
+	const (
+		shortDelayS             = 10
+		shortDelayMultiplicator = 6
+		longDelayS              = 60
+		longDelayTimeout        = time.Minute
+	)
 	if eventDelayS < shortDelayS {
-		return time.Duration(eventDelayS*shortDelayMultiplicator) * time.Second
+		return time.Duration(eventDelayS * shortDelayMultiplicator * float64(time.Second))
 	}
 	if eventDelayS < longDelayS {
 		return longDelayTimeout
 	}
-	return time.Duration(eventDelayS) * time.Second
+	return time.Duration(eventDelayS * float64(time.Second))
 }

@@ -9,17 +9,20 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/julienschmidt/httprouter"
 
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/structutil"
 )
 
 type configMuxBuilder struct {
 	*httprouter.Router
+
 	id  protocol.DeviceID
 	cfg config.Wrapper
 }
@@ -63,6 +66,10 @@ func (c *configMuxBuilder) registerFolders(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		data, err := unmarshalToRawMessages(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		folders := make([]config.FolderConfiguration, len(data))
 		defaultFolder := c.cfg.DefaultFolder()
 		for i, bs := range data {
@@ -94,6 +101,10 @@ func (c *configMuxBuilder) registerDevices(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		data, err := unmarshalToRawMessages(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		devices := make([]config.DeviceConfiguration, len(data))
 		defaultDevice := c.cfg.DefaultDevice()
 		for i, bs := range data {
@@ -204,7 +215,7 @@ func (c *configMuxBuilder) registerDefaultFolder(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		var cfg config.FolderConfiguration
-		util.SetDefaults(&cfg)
+		structutil.SetDefaults(&cfg)
 		c.adjustFolder(w, r, cfg, true)
 	})
 
@@ -220,12 +231,34 @@ func (c *configMuxBuilder) registerDefaultDevice(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		var cfg config.DeviceConfiguration
-		util.SetDefaults(&cfg)
+		structutil.SetDefaults(&cfg)
 		c.adjustDevice(w, r, cfg, true)
 	})
 
 	c.HandlerFunc(http.MethodPatch, path, func(w http.ResponseWriter, r *http.Request) {
 		c.adjustDevice(w, r, c.cfg.DefaultDevice(), true)
+	})
+}
+
+func (c *configMuxBuilder) registerDefaultIgnores(path string) {
+	c.HandlerFunc(http.MethodGet, path, func(w http.ResponseWriter, _ *http.Request) {
+		sendJSON(w, c.cfg.DefaultIgnores())
+	})
+
+	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
+		var ignores config.Ignores
+		if err := unmarshalTo(r.Body, &ignores); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		waiter, err := c.cfg.Modify(func(cfg *config.Configuration) {
+			cfg.Defaults.Ignores = ignores
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		c.finish(w, waiter)
 	})
 }
 
@@ -236,7 +269,7 @@ func (c *configMuxBuilder) registerOptions(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		var cfg config.OptionsConfiguration
-		util.SetDefaults(&cfg)
+		structutil.SetDefaults(&cfg)
 		c.adjustOptions(w, r, cfg)
 	})
 
@@ -252,7 +285,7 @@ func (c *configMuxBuilder) registerLDAP(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		var cfg config.LDAPConfiguration
-		util.SetDefaults(&cfg)
+		structutil.SetDefaults(&cfg)
 		c.adjustLDAP(w, r, cfg)
 	})
 
@@ -268,7 +301,7 @@ func (c *configMuxBuilder) registerGUI(path string) {
 
 	c.HandlerFunc(http.MethodPut, path, func(w http.ResponseWriter, r *http.Request) {
 		var cfg config.GUIConfiguration
-		util.SetDefaults(&cfg)
+		structutil.SetDefaults(&cfg)
 		c.adjustGUI(w, r, cfg)
 	})
 
@@ -281,20 +314,17 @@ func (c *configMuxBuilder) adjustConfig(w http.ResponseWriter, r *http.Request) 
 	to, err := config.ReadJSON(r.Body, c.id)
 	r.Body.Close()
 	if err != nil {
-		l.Warnln("Decoding posted config:", err)
+		slog.Error("Failed to decode posted config", slogutil.Error(err))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	var errMsg string
 	var status int
 	waiter, err := c.cfg.Modify(func(cfg *config.Configuration) {
-		if to.GUI.Password != cfg.GUI.Password {
-			if err := to.GUI.HashAndSetPassword(to.GUI.Password); err != nil {
-				l.Warnln("hashing password:", err)
-				errMsg = err.Error()
-				status = http.StatusInternalServerError
-				return
-			}
+		if err := c.postAdjustGui(&cfg.GUI, &to.GUI); err != nil {
+			errMsg = err.Error()
+			status = http.StatusInternalServerError
+			return
 		}
 		*cfg = to
 	})
@@ -361,7 +391,6 @@ func (c *configMuxBuilder) adjustOptions(w http.ResponseWriter, r *http.Request,
 }
 
 func (c *configMuxBuilder) adjustGUI(w http.ResponseWriter, r *http.Request, gui config.GUIConfiguration) {
-	oldPassword := gui.Password
 	err := unmarshalTo(r.Body, &gui)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -370,13 +399,10 @@ func (c *configMuxBuilder) adjustGUI(w http.ResponseWriter, r *http.Request, gui
 	var errMsg string
 	var status int
 	waiter, err := c.cfg.Modify(func(cfg *config.Configuration) {
-		if gui.Password != oldPassword {
-			if err := gui.HashAndSetPassword(gui.Password); err != nil {
-				l.Warnln("hashing password:", err)
-				errMsg = err.Error()
-				status = http.StatusInternalServerError
-				return
-			}
+		if err := c.postAdjustGui(&cfg.GUI, &gui); err != nil {
+			errMsg = err.Error()
+			status = http.StatusInternalServerError
+			return
 		}
 		cfg.GUI = gui
 	})
@@ -387,6 +413,16 @@ func (c *configMuxBuilder) adjustGUI(w http.ResponseWriter, r *http.Request, gui
 		return
 	}
 	c.finish(w, waiter)
+}
+
+func (c *configMuxBuilder) postAdjustGui(from *config.GUIConfiguration, to *config.GUIConfiguration) error {
+	if to.Password != from.Password {
+		if err := to.SetPassword(to.Password); err != nil {
+			slog.Error("Failed to hash password", slogutil.Error(err))
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *configMuxBuilder) adjustLDAP(w http.ResponseWriter, r *http.Request, ldap config.LDAPConfiguration) {
@@ -405,7 +441,7 @@ func (c *configMuxBuilder) adjustLDAP(w http.ResponseWriter, r *http.Request, ld
 }
 
 // Unmarshals the content of the given body and stores it in to (i.e. to must be a pointer).
-func unmarshalTo(body io.ReadCloser, to interface{}) error {
+func unmarshalTo(body io.ReadCloser, to any) error {
 	bs, err := io.ReadAll(body)
 	body.Close()
 	if err != nil {
@@ -423,7 +459,7 @@ func unmarshalToRawMessages(body io.ReadCloser) ([]json.RawMessage, error) {
 func (c *configMuxBuilder) finish(w http.ResponseWriter, waiter config.Waiter) {
 	waiter.Wait()
 	if err := c.cfg.Save(); err != nil {
-		l.Warnln("Saving config:", err)
+		slog.Error("Failed to save config", slogutil.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
